@@ -280,11 +280,19 @@ app.post('/api/skus/:sku/sync', async (req, res) => {
   }
 });
 
-// GET /api/products - listar productos de Tiendanube para vincular
+// GET /api/products - listar TODOS los productos de Tiendanube (paginado)
 app.get('/api/products', async (req, res) => {
   try {
-    const products = await tiendanubeRequest('GET', '/products?per_page=50&fields=id,name,variants');
-    res.json(products);
+    let allProducts = [];
+    let page = 1;
+    while (true) {
+      const batch = await tiendanubeRequest('GET', `/products?per_page=50&page=${page}&fields=id,name,variants`);
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      allProducts = allProducts.concat(batch);
+      if (batch.length < 50) break;
+      page++;
+    }
+    res.json(allProducts);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
