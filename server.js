@@ -374,7 +374,11 @@ app.get('/api/stats', (req, res) => {
 
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`\n🚀 Stock Central corriendo en http://localhost:${PORT}`);
-  console.log(`📦 Base de datos: ./data/db.json`);
-  console.log(`🔗 Webhook endpoint: http://localhost:${PORT}/webhook/order\n`);
+  console.log('Stock Central corriendo en puerto ' + PORT);
+  if (process.env.ACCESS_TOKEN && process.env.STORE_ID) {
+    db.set('config.access_token', process.env.ACCESS_TOKEN)
+      .set('config.store_id', process.env.STORE_ID)
+      .write();
+    console.log('Credenciales cargadas: store ' + process.env.STORE_ID);
+  }
 });
