@@ -117,8 +117,8 @@ app.post('/api/config', (req, res) => {
 // POST /api/config/test - testear conexión con Tiendanube
 app.post('/api/config/test', async (req, res) => {
   try {
-    const store = await tiendanubeRequest('GET', '');
-    res.json({ ok: true, store_name: store.name?.es || store.name || 'Tienda OK' });
+    const products = await tiendanubeRequest('GET', '/products?per_page=1');
+    res.json({ ok: true, store_name: 'Tienda conectada OK' });
   } catch (err) {
     res.status(400).json({ ok: false, error: err.message });
   }
