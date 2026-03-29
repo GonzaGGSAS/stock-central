@@ -36,6 +36,8 @@ db.defaults({
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
+const path = require('path');
+app.use('/static', express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3001;
 const RESERVATION_DURATION_MS = 30 * 60 * 1000; // ─── NUEVO: 30 minutos
