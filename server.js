@@ -36,8 +36,6 @@ db.defaults({
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
-const path = require('path');
-app.use('/static', express.static(path.join(__dirname, 'public')));
 
 const PORT = process.env.PORT || 3001;
 const RESERVATION_DURATION_MS = 30 * 60 * 1000; // ─── NUEVO: 30 minutos
@@ -343,21 +341,18 @@ app.get('/api/products', async (req, res) => {
   try {
     let allProducts = [];
     let page = 1;
-   while (true) {
-  const batch = await tiendanubeRequest('GET', `/products?per_page=50&page=${page}&fields=id,name,variants`);
-  if (!Array.isArray(batch) || batch.length === 0) break;
-  allProducts = allProducts.concat(batch);
-  if (batch.length < 50) break;
-  page++;
-}
-// Filtrar productos personalizados (se manejan por WhatsApp)
-allProducts = allProducts.filter(p => {
-  const name = (p.name?.es || p.name || '').toUpperCase();
-  return !name.includes('PERSONALIZADO');
-});
-if (batch.length < 50) break;
+    while (true) {
+      const batch = await tiendanubeRequest('GET', `/products?per_page=50&page=${page}&fields=id,name,variants`);
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      allProducts = allProducts.concat(batch);
+      if (batch.length < 50) break;
       page++;
     }
+    // Filtrar productos personalizados (se manejan por WhatsApp)
+    allProducts = allProducts.filter(p => {
+      const name = (p.name?.es || p.name || '').toUpperCase();
+      return !name.includes('PERSONALIZADO');
+    });
     res.json(allProducts);
   } catch (err) {
     res.status(500).json({ error: err.message });
