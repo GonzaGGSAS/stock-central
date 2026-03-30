@@ -347,7 +347,12 @@ app.get('/api/products', async (req, res) => {
       const batch = await tiendanubeRequest('GET', `/products?per_page=50&page=${page}&fields=id,name,variants`);
       if (!Array.isArray(batch) || batch.length === 0) break;
       allProducts = allProducts.concat(batch);
-      if (batch.length < 50) break;
+// Filtrar productos personalizados (se manejan por WhatsApp)
+allProducts = allProducts.filter(p => {
+  const name = (p.name?.es || p.name || '').toUpperCase();
+  return !name.includes('PERSONALIZADO');
+});
+if (batch.length < 50) break;
       page++;
     }
     res.json(allProducts);
