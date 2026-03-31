@@ -260,16 +260,16 @@ app.post('/api/reserve', async (req, res) => {
     return res.status(409).json({ ok: false, error: 'Stock insuficiente', available });
   }
 
-  // Verificar si ya existe reserva activa para esta sesion y variante
+  // Verificar si ya existe reserva activa para esta sesion Y este variant_id especifico de TN
   const existing = db.get('reservations')
-    .find(r => r.sessionId === sessionId && r.varianteId === foundVar.id && r.expiresAt > now)
+    .find(r => r.sessionId === sessionId && r.tnVariantId === String(variant_id) && r.expiresAt > now)
     .value();
 
   if (existing) {
-    // Actualizar reserva existente
+    // Actualizar reserva existente (misma prenda, misma sesion)
     db.get('reservations').find({ id: existing.id })
       .assign({ qty, expiresAt: now + RESERVATION_MS }).write();
-    console.log(`[RESERVAS] Actualizada: sesion ${sessionId} variante ${foundVar.label} qty ${qty}`);
+    console.log(`[RESERVAS] Actualizada: sesion ${sessionId} tnVariant ${variant_id} qty ${qty}`);
     return res.json({ ok: true, managed: true, reservation_id: existing.id, updated: true });
   }
 
@@ -280,6 +280,7 @@ app.post('/api/reserve', async (req, res) => {
   db.get('reservations').push({
     id: reservationId, sessionId,
     productoId: foundProd.id, varianteId: foundVar.id,
+    tnVariantId: String(variant_id),
     qty: parseInt(qty), expiresAt: now + RESERVATION_MS
   }).write();
 
