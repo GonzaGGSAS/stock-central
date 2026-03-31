@@ -266,10 +266,24 @@ app.post('/api/reserve', async (req, res) => {
     .value();
 
   if (existing) {
-    // Actualizar reserva existente (misma prenda, misma sesion)
+    // Sumar al stock reservado (misma prenda, misma sesion, mas unidades)
+    const extraQty = parseInt(qty);
+    const newQty = existing.qty + extraQty;
+    const newStock = foundVar.stock - extraQty;
+
     db.get('reservations').find({ id: existing.id })
-      .assign({ qty, expiresAt: now + RESERVATION_MS }).write();
-    console.log(`[RESERVAS] Actualizada: sesion ${sessionId} tnVariant ${variant_id} qty ${qty}`);
+      .assign({ qty: newQty, expiresAt: now + RESERVATION_MS }).write();
+
+    db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
+      .assign({ stock: newStock }).get('log').unshift({
+        ts: new Date().toISOString(), action: 'reserved',
+        reservation_id: existing.id, session_id: sessionId,
+        delta: -extraQty, stock: newStock, reason: 'Reserva acumulada (mas unidades)'
+      }).write();
+
+    syncVariante(foundProd.id, foundVar.id).catch(e => console.error('[RESERVAS] Sync error:', e.message));
+
+    console.log(`[RESERVAS] Acumulada: sesion ${sessionId} tnVariant ${variant_id} qty ${existing.qty}+${extraQty}=${newQty} | stock → ${newStock}`);
     return res.json({ ok: true, managed: true, reservation_id: existing.id, updated: true });
   }
 
