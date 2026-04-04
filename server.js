@@ -17,7 +17,8 @@ const db = low(adapter);
 db.defaults({
   config: { access_token: '', store_id: '', webhook_registered: false },
   productos: [],
-  reservations: [] // { id, sessionId, productoId, varianteId, qty, expiresAt }
+  reservations: [], // { id, sessionId, productoId, varianteId, qty, expiresAt }
+  matchs: []        // { id, nombre, producto1: {tn_product_id, nombre}, producto2: {tn_product_id, nombre} }
 }).write();
 
 const app = express();
@@ -458,6 +459,36 @@ app.post('/webhook/order', async (req, res) => {
 });
 
 app.post('/webhook/privacy', (req, res) => res.sendStatus(200));
+
+
+// ════════════════════════════════════════════════════════════════════════════
+// Matchs
+// ════════════════════════════════════════════════════════════════════════════
+
+app.get('/api/matchs', (req, res) => {
+  res.json(db.get('matchs').value());
+});
+
+app.post('/api/matchs', (req, res) => {
+  const { nombre, producto1, producto2 } = req.body;
+  if (!nombre || !producto1 || !producto2 || !producto1.tn_product_id || !producto2.tn_product_id) {
+    return res.status(400).json({ error: 'Faltan datos: nombre, producto1, producto2' });
+  }
+  const nuevo = {
+    id: 'match_' + Date.now(),
+    nombre,
+    producto1: { tn_product_id: String(producto1.tn_product_id), nombre: producto1.nombre || '' },
+    producto2: { tn_product_id: String(producto2.tn_product_id), nombre: producto2.nombre || '' },
+    createdAt: new Date().toISOString()
+  };
+  db.get('matchs').push(nuevo).write();
+  res.json(nuevo);
+});
+
+app.delete('/api/matchs/:id', (req, res) => {
+  db.get('matchs').remove({ id: req.params.id }).write();
+  res.json({ ok: true });
+});
 
 // ════════════════════════════════════════════════════════════════════════════
 // Stats
