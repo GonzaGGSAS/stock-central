@@ -470,19 +470,34 @@ app.get('/api/matchs', (req, res) => {
 });
 
 app.post('/api/matchs', (req, res) => {
-  const { nombre, producto1, producto2 } = req.body;
-  if (!nombre || !producto1 || !producto2 || !producto1.tn_product_id || !producto2.tn_product_id) {
-    return res.status(400).json({ error: 'Faltan datos: nombre, producto1, producto2' });
+  const { nombre, producto1, producto2, tn_match_product_id } = req.body;
+  if (!nombre || !producto1 || !producto2 || !producto1.tn_product_id || !producto2.tn_product_id || !tn_match_product_id) {
+    return res.status(400).json({ error: 'Faltan datos: nombre, producto1, producto2, tn_match_product_id' });
   }
   const nuevo = {
     id: 'match_' + Date.now(),
     nombre,
+    tn_match_product_id: String(tn_match_product_id),
     producto1: { tn_product_id: String(producto1.tn_product_id), nombre: producto1.nombre || '' },
     producto2: { tn_product_id: String(producto2.tn_product_id), nombre: producto2.nombre || '' },
     createdAt: new Date().toISOString()
   };
   db.get('matchs').push(nuevo).write();
   res.json(nuevo);
+});
+
+// GET /api/tn-product/:id/variants — proxy para obtener variantes con stock de un producto TN
+app.get('/api/tn-product/:id/variants', async (req, res) => {
+  try {
+    const product = await tnRequest('GET', `/products/${req.params.id}?fields=id,name,variants`);
+    const variants = (product.variants || []).map(v => ({
+      id: v.id,
+      sku: v.sku || '',
+      stock: v.stock ?? null,
+      values: v.values || [],
+    }));
+    res.json({ id: product.id, name: product.name, variants });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.delete('/api/matchs/:id', (req, res) => {
