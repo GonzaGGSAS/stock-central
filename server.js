@@ -412,7 +412,33 @@ app.post('/webhook/order', async (req, res) => {
         if (foundProd) break;
       }
       if (!foundProd || !foundVar) {
-        console.log(`[WEBHOOK] variant_id ${variant_id} no gestionada. Ignorado.`);
+        // Verificar si es un producto Match (sc-match)
+        const matchFound = db.get('matchs').find(m => 
+          m.variantMap && m.variantMap.some(vm => vm.tn_variant_id === String(variant_id))
+        ).value();
+        
+        if (matchFound && event === 'order/paid') {
+          const vm = matchFound.variantMap.find(vm => vm.tn_variant_id === String(variant_id));
+          console.log(`[WEBHOOK] Match detectado: ${matchFound.nombre} | variante: ${vm.label}`);
+          // Descontar stock de producto 1
+          await tnRequest('GET', `/products/${matchFound.producto1.tn_product_id}/variants/${vm.v1id}`)
+            .then(async v1 => {
+              const newStock1 = Math.max(0, (v1.stock || 0) - quantity);
+              await tnRequest('PUT', `/products/${matchFound.producto1.tn_product_id}/variants/${vm.v1id}`, { stock: newStock1 });
+              console.log(`[WEBHOOK] Match: Prod1 variante ${vm.v1id}: stock → ${newStock1}`);
+            }).catch(e => console.error('[WEBHOOK] Error descontando prod1:', e.message));
+          // Descontar stock de producto 2
+          await tnRequest('GET', `/products/${matchFound.producto2.tn_product_id}/variants/${vm.v2id}`)
+            .then(async v2 => {
+              const newStock2 = Math.max(0, (v2.stock || 0) - quantity);
+              await tnRequest('PUT', `/products/${matchFound.producto2.tn_product_id}/variants/${vm.v2id}`, { stock: newStock2 });
+              console.log(`[WEBHOOK] Match: Prod2 variante ${vm.v2id}: stock → ${newStock2}`);
+            }).catch(e => console.error('[WEBHOOK] Error descontando prod2:', e.message));
+          // Re-sincronizar stock del contenedor
+          await fetch(`http://localhost:${process.env.PORT || 3001}/api/matchs/${matchFound.id}/sync-stock`, { method: 'PUT' }).catch(() => {});
+        } else {
+          console.log(`[WEBHOOK] variant_id ${variant_id} no gestionada. Ignorado.`);
+        }
         continue;
       }
 
@@ -469,21 +495,92 @@ app.get('/api/matchs', (req, res) => {
   res.json(db.get('matchs').value());
 });
 
-app.post('/api/matchs', (req, res) => {
-  const { nombre, producto1, producto2, tn_match_product_id } = req.body;
-  if (!nombre || !producto1 || !producto2 || !producto1.tn_product_id || !producto2.tn_product_id || !tn_match_product_id) {
-    return res.status(400).json({ error: 'Faltan datos: nombre, producto1, producto2, tn_match_product_id' });
+app.post('/api/matchs', async (req, res) => {
+  const { nombre, producto1, producto2 } = req.body;
+  if (!nombre || !producto1?.tn_product_id || !producto2?.tn_product_id) {
+    return res.status(400).json({ error: 'Faltan datos: nombre, producto1, producto2' });
   }
-  const nuevo = {
-    id: 'match_' + Date.now(),
-    nombre,
-    tn_match_product_id: String(tn_match_product_id),
-    producto1: { tn_product_id: String(producto1.tn_product_id), nombre: producto1.nombre || '' },
-    producto2: { tn_product_id: String(producto2.tn_product_id), nombre: producto2.nombre || '' },
-    createdAt: new Date().toISOString()
-  };
-  db.get('matchs').push(nuevo).write();
-  res.json(nuevo);
+  try {
+    // 1. Obtener variantes de ambos productos
+    const [p1data, p2data] = await Promise.all([
+      tnRequest('GET', `/products/${producto1.tn_product_id}?fields=id,name,variants`),
+      tnRequest('GET', `/products/${producto2.tn_product_id}?fields=id,name,variants`)
+    ]);
+
+    const p1name = producto1.nombre || (typeof p1data.name === 'object' ? p1data.name.es : p1data.name) || 'Producto 1';
+    const p2name = producto2.nombre || (typeof p2data.name === 'object' ? p2data.name.es : p2data.name) || 'Producto 2';
+
+    const v1list = p1data.variants.filter(v => v.stock === null || v.stock > 0);
+    const v2list = p2data.variants.filter(v => v.stock === null || v.stock > 0);
+
+    if (v1list.length === 0 || v2list.length === 0) {
+      return res.status(400).json({ error: 'Uno de los productos no tiene variantes con stock' });
+    }
+
+    // 2. Generar todas las combinaciones de variantes
+    function getLabel(v) {
+      if (v.values && v.values.length > 0) {
+        const val = v.values[0];
+        return val.es || val.en || Object.values(val)[0] || String(v.id);
+      }
+      return v.sku || String(v.id);
+    }
+
+    // 3. Crear producto contenedor en TN
+    const attributes = [
+      { en: `${p1name} - Talle`, es: `${p1name} - Talle`, pt: `${p1name} - Talle` },
+      { en: `${p2name} - Talle`, es: `${p2name} - Talle`, pt: `${p2name} - Talle` }
+    ];
+
+    // Construir variantes combinadas
+    const variantesBody = [];
+    const variantMap = []; // para guardar el mapa v1id+v2id => variant
+
+    for (const v1 of v1list) {
+      for (const v2 of v2list) {
+        const stock = Math.min(
+          v1.stock === null ? 9999 : v1.stock,
+          v2.stock === null ? 9999 : v2.stock
+        );
+        variantesBody.push({
+          values: [getLabel(v1), getLabel(v2)],
+          price: null, // hereda del producto
+          stock: stock === 9999 ? null : stock,
+          weight: 1
+        });
+        variantMap.push({ v1id: String(v1.id), v2id: String(v2.id), label: `${getLabel(v1)} / ${getLabel(v2)}` });
+      }
+    }
+
+    const productBody = {
+      name: { es: nombre, en: nombre, pt: nombre },
+      description: { es: '', en: '', pt: '' },
+      tags: 'sc-match',
+      attributes,
+      variants: variantesBody,
+      published: true
+    };
+
+    const tnProduct = await tnRequest('POST', '/products', productBody);
+    const tnMatchProductId = String(tnProduct.id);
+
+    // 4. Guardar match en DB con el mapa de variantes
+    const nuevo = {
+      id: 'match_' + Date.now(),
+      nombre,
+      tn_match_product_id: tnMatchProductId,
+      producto1: { tn_product_id: String(producto1.tn_product_id), nombre: p1name, variantes: v1list.map(v => ({ id: String(v.id), label: getLabel(v), stock: v.stock })) },
+      producto2: { tn_product_id: String(producto2.tn_product_id), nombre: p2name, variantes: v2list.map(v => ({ id: String(v.id), label: getLabel(v), stock: v.stock })) },
+      variantMap: variantMap.map((vm, i) => ({ ...vm, tn_variant_id: String(tnProduct.variants[i]?.id || '') })),
+      createdAt: new Date().toISOString()
+    };
+    db.get('matchs').push(nuevo).write();
+    console.log(`[MATCH] Creado: ${nombre} | TN product: ${tnMatchProductId} | ${variantesBody.length} variantes`);
+    res.json(nuevo);
+  } catch (e) {
+    console.error('[MATCH] Error creando:', e.message);
+    res.status(500).json({ error: e.message });
+  }
 });
 
 // GET /api/tn-product/:id/variants — proxy para obtener variantes con stock de un producto TN
@@ -500,9 +597,42 @@ app.get('/api/tn-product/:id/variants', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.delete('/api/matchs/:id', (req, res) => {
+app.delete('/api/matchs/:id', async (req, res) => {
+  const match = db.get('matchs').find({ id: req.params.id }).value();
+  if (!match) return res.status(404).json({ error: 'Match no encontrado' });
+  try {
+    // Eliminar producto contenedor de TN
+    if (match.tn_match_product_id) {
+      await tnRequest('DELETE', `/products/${match.tn_match_product_id}`).catch(e => {
+        console.warn('[MATCH] No se pudo eliminar producto TN:', e.message);
+      });
+    }
+  } catch (e) { console.warn('[MATCH] Error eliminando en TN:', e.message); }
   db.get('matchs').remove({ id: req.params.id }).write();
   res.json({ ok: true });
+});
+
+// PUT /api/matchs/:id/sync-stock — recalcular stock del contenedor basado en productos individuales
+app.put('/api/matchs/:id/sync-stock', async (req, res) => {
+  const match = db.get('matchs').find({ id: req.params.id }).value();
+  if (!match) return res.status(404).json({ error: 'Match no encontrado' });
+  try {
+    const [p1data, p2data] = await Promise.all([
+      tnRequest('GET', `/products/${match.producto1.tn_product_id}?fields=id,variants`),
+      tnRequest('GET', `/products/${match.producto2.tn_product_id}?fields=id,variants`)
+    ]);
+    const p1varMap = Object.fromEntries(p1data.variants.map(v => [String(v.id), v.stock]));
+    const p2varMap = Object.fromEntries(p2data.variants.map(v => [String(v.id), v.stock]));
+    let updated = 0;
+    for (const vm of (match.variantMap || [])) {
+      const s1 = p1varMap[vm.v1id] ?? null;
+      const s2 = p2varMap[vm.v2id] ?? null;
+      const newStock = (s1 === null && s2 === null) ? null : Math.min(s1 === null ? 9999 : s1, s2 === null ? 9999 : s2);
+      await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
+      updated++;
+    }
+    res.json({ ok: true, updated });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
