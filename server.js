@@ -75,6 +75,71 @@ function getAvailableStock(productoId, varianteId) {
   return Math.max(0, variante.stock - reservado);
 }
 
+// ─── Helper: buscar match por tn_variant_id del contenedor ─────────────────
+function findMatchByContainerVariant(tn_variant_id) {
+  const matchs = db.get('matchs').value();
+  for (const m of matchs) {
+    if (!m.variantMap) continue;
+    const vm = m.variantMap.find(v => v.tn_variant_id === String(tn_variant_id));
+    if (vm) return { match: m, vm };
+  }
+  return null;
+}
+
+// ─── Helper: reservar variante individual de producto ────────────────────────
+async function reservarVarianteIndividual(sessionId, tn_variant_id, qty, matchReservationId) {
+  const productos = db.get('productos').value();
+  let foundProd = null, foundVar = null;
+  for (const p of productos) {
+    for (const v of p.variantes) {
+      if (v.links.some(l => l.variant_id === String(tn_variant_id))) { foundProd = p; foundVar = v; break; }
+    }
+    if (foundProd) break;
+  }
+  if (!foundProd || !foundVar) {
+    console.log(`[MATCH-RESERVA] Variante individual ${tn_variant_id} no en Stock Central, descontando directo en TN`);
+    // Descontar directamente en TN si no está en Stock Central
+    try {
+      const variant = await tnRequest('GET', `/products/${foundProd?.id || 0}/variants/${tn_variant_id}`).catch(() => null);
+      if (variant) {
+        const newStock = Math.max(0, (variant.stock || 0) - qty);
+        await tnRequest('PUT', `/products/${variant.product_id}/variants/${tn_variant_id}`, { stock: newStock });
+      }
+    } catch(e) { console.warn('[MATCH-RESERVA] Error desconto TN directo:', e.message); }
+    return null;
+  }
+
+  const now = Date.now();
+  const available = getAvailableStock(foundProd.id, foundVar.id);
+  if (available < qty) {
+    console.warn(`[MATCH-RESERVA] Stock insuficiente para ${foundProd.nombre}/${foundVar.label}: disponible ${available}`);
+    return null;
+  }
+
+  const reservationId = `res_match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+  const newStock = foundVar.stock - parseInt(qty);
+
+  db.get('reservations').push({
+    id: reservationId, sessionId,
+    productoId: foundProd.id, varianteId: foundVar.id,
+    tnVariantId: String(tn_variant_id),
+    qty: parseInt(qty), expiresAt: now + RESERVATION_MS,
+    matchReservationId: matchReservationId || null // para agrupar reservas del mismo match
+  }).write();
+
+  db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
+    .assign({ stock: newStock }).get('log').unshift({
+      ts: new Date().toISOString(), action: 'reserved',
+      reservation_id: reservationId, session_id: sessionId,
+      delta: -parseInt(qty), stock: newStock,
+      reason: 'Reserva de carrito Match (30 min)'
+    }).write();
+
+  syncVariante(foundProd.id, foundVar.id).catch(e => console.error('[MATCH-RESERVA] Sync error:', e.message));
+  console.log(`[MATCH-RESERVA] ${foundProd.nombre}/${foundVar.label}: stock ${foundVar.stock} → ${newStock}`);
+  return reservationId;
+}
+
 // ─── Cron: liberar reservas expiradas cada 60 seg ───────────────────────────
 setInterval(async () => {
   const now = Date.now();
@@ -251,6 +316,19 @@ app.post('/api/reserve', async (req, res) => {
   }
 
   if (!foundProd || !foundVar) {
+    // Verificar si es un variant de un Match contenedor
+    const matchResult = findMatchByContainerVariant(variant_id);
+    if (matchResult) {
+      const { match, vm } = matchResult;
+      console.log(`[MATCH-RESERVA] Reservando Match: ${match.nombre} | combo: ${vm.label}`);
+      const matchResId = `mres_${Date.now()}`;
+      // Reservar ambas variantes individuales
+      await Promise.all([
+        reservarVarianteIndividual(sessionId, vm.v1id, qty, matchResId),
+        reservarVarianteIndividual(sessionId, vm.v2id, qty, matchResId)
+      ]);
+      return res.json({ ok: true, managed: true, match: match.nombre, combo: vm.label });
+    }
     return res.json({ ok: true, managed: false, reason: 'Variante no gestionada por Stock Central' });
   }
 
@@ -322,19 +400,30 @@ app.delete('/api/reserve/:sessionId', async (req, res) => {
 
   let toRelease;
   if (variant_id) {
-    // Buscar productoId/varianteId por variant_id de TN
-    const productos = db.get('productos').value();
-    let foundProd = null, foundVar = null;
-    for (const p of productos) {
-      for (const v of p.variantes) {
-        if (v.links.some(l => l.variant_id === String(variant_id))) { foundProd = p; foundVar = v; break; }
+    // Verificar si es un variant de un Match contenedor
+    const matchResult = findMatchByContainerVariant(variant_id);
+    if (matchResult) {
+      const { match, vm } = matchResult;
+      // Liberar reservas de ambas variantes individuales del match
+      toRelease = db.get('reservations')
+        .filter(r => r.sessionId === sessionId && r.expiresAt > now &&
+          (r.tnVariantId === vm.v1id || r.tnVariantId === vm.v2id))
+        .value();
+    } else {
+      // Buscar productoId/varianteId por variant_id de TN normal
+      const productos = db.get('productos').value();
+      let foundProd = null, foundVar = null;
+      for (const p of productos) {
+        for (const v of p.variantes) {
+          if (v.links.some(l => l.variant_id === String(variant_id))) { foundProd = p; foundVar = v; break; }
+        }
+        if (foundProd) break;
       }
-      if (foundProd) break;
+      if (!foundVar) return res.json({ ok: true, released: 0 });
+      toRelease = db.get('reservations')
+        .filter(r => r.sessionId === sessionId && r.varianteId === foundVar.id && r.expiresAt > now)
+        .value();
     }
-    if (!foundVar) return res.json({ ok: true, released: 0 });
-    toRelease = db.get('reservations')
-      .filter(r => r.sessionId === sessionId && r.varianteId === foundVar.id && r.expiresAt > now)
-      .value();
   } else {
     toRelease = db.get('reservations')
       .filter(r => r.sessionId === sessionId && r.expiresAt > now)
