@@ -227,6 +227,61 @@ app.post('/api/productos/:id/sync', async (req, res) => {
   } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// POST /api/productos/:id/sync-variantes — importar variantes faltantes desde TN
+app.post('/api/productos/:id/sync-variantes', async (req, res) => {
+  const prod = db.get('productos').find({ id: req.params.id }).value();
+  if (!prod) return res.status(404).json({ error: 'Producto no encontrado' });
+
+  try {
+    // Buscar el product_id de TN buscando en los links de las variantes existentes
+    let tnProductId = null;
+    for (const v of prod.variantes) {
+      if (v.links && v.links.length > 0) { tnProductId = v.links[0].product_id; break; }
+    }
+    if (!tnProductId) return res.status(400).json({ error: 'No hay links a TN. Vinculá al menos una variante primero.' });
+
+    // Traer todas las variantes del producto en TN
+    const tnProduct = await tnRequest('GET', `/products/${tnProductId}?fields=id,name,variants`);
+    const tnVariants = tnProduct.variants || [];
+
+    // Ver qué variant_ids ya están en Stock Central
+    const linkedVariantIds = new Set();
+    for (const v of prod.variantes) {
+      for (const l of v.links) linkedVariantIds.add(l.variant_id);
+    }
+
+    // Agregar las que faltan
+    const added = [];
+    const skipped = [];
+
+    for (const tnV of tnVariants) {
+      const tnVId = String(tnV.id);
+      if (linkedVariantIds.has(tnVId)) { skipped.push(tnVId); continue; }
+
+      // Construir label de la variante
+      const vLabel = tnV.values?.map(vv => Object.values(vv)[0]).join(' / ') || `Variante ${tnV.id}`;
+      const pName = typeof tnProduct.name === 'object' ? (tnProduct.name.es || '') : String(tnProduct.name);
+      const label = `${pName} · ${vLabel}`;
+      const stock = tnV.stock ?? 0;
+
+      // Crear variante en Stock Central
+      const varId = `var_${Date.now()}_${Math.random().toString(36).substr(2,4)}`;
+      const nueva = {
+        id: varId, label: vLabel, stock,
+        links: [{ product_id: tnProductId, variant_id: tnVId, label }],
+        log: [{ ts: new Date().toISOString(), action: 'created', stock, reason: 'Importada desde TN (sync-variantes)' }]
+      };
+      db.get('productos').find({ id: req.params.id }).get('variantes').push(nueva).write();
+      added.push({ label: vLabel, stock, variant_id: tnVId });
+    }
+
+    console.log(`[SYNC-VAR] ${prod.nombre}: +${added.length} variantes importadas, ${skipped.length} ya existían`);
+    res.json({ ok: true, added: added.length, skipped: skipped.length, variantes: added });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // Variantes internas
 // ════════════════════════════════════════════════════════════════════════════
