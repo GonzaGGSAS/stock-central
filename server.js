@@ -164,6 +164,47 @@ setInterval(async () => {
   db.get('reservations').remove(r => r.expiresAt <= now).write();
 }, 60 * 1000);
 
+// ─── Cron: reconciliar stock cada 6 horas ────────────────────────────────────
+setInterval(async () => {
+  console.log('[RECONCILIAR] Iniciando chequeo de stock...');
+  const productos = db.get('productos').value();
+  let corregidos = 0, chequeados = 0, errores = 0;
+
+  for (const prod of productos) {
+    for (const variante of prod.variantes) {
+      if (!variante.links || variante.links.length === 0) continue;
+
+      // Tomar el primer link como referencia del stock en TN
+      const link = variante.links[0];
+      try {
+        const tnVariant = await tnRequest('GET', `/products/${link.product_id}/variants/${link.variant_id}`);
+        chequeados++;
+        const tnStock = tnVariant.stock ?? null;
+
+        // Si el stock en TN difiere del de Stock Central, corregir
+        if (tnStock !== null && tnStock !== variante.stock) {
+          console.log(`[RECONCILIAR] Discrepancia: ${prod.nombre}/${variante.label} | SC: ${variante.stock} | TN: ${tnStock} → corrigiendo SC`);
+          db.get('productos').find({ id: prod.id }).get('variantes').find({ id: variante.id })
+            .assign({ stock: tnStock }).get('log').unshift({
+              ts: new Date().toISOString(), action: 'reconciled',
+              delta: tnStock - variante.stock, stock: tnStock,
+              reason: `Reconciliación automática (SC: ${variante.stock} → TN: ${tnStock})`
+            }).write();
+          corregidos++;
+        }
+      } catch (e) {
+        errores++;
+        console.warn(`[RECONCILIAR] Error chequeando ${prod.nombre}/${variante.label}:`, e.message);
+      }
+
+      // Pequeña pausa para no saturar la API de TN
+      await new Promise(r => setTimeout(r, 200));
+    }
+  }
+
+  console.log(`[RECONCILIAR] Completado: ${chequeados} chequeados, ${corregidos} corregidos, ${errores} errores`);
+}, 6 * 60 * 60 * 1000); // cada 6 horas
+
 // ════════════════════════════════════════════════════════════════════════════
 // Config
 // ════════════════════════════════════════════════════════════════════════════
