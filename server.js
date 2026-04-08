@@ -156,7 +156,7 @@ setInterval(async () => {
       .assign({ stock: newStock }).get('log').unshift({
         ts: new Date().toISOString(), action: 'reservation_expired',
         reservation_id: r.id, delta: +r.qty, stock: newStock,
-        reason: 'Reserva expirada (30 min sin pago)'
+        reason: `Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Expiró sin pago (30 min)`
       }).write();
     syncVariante(r.productoId, r.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
     console.log(`[RESERVAS] ${r.productoId}/${r.varianteId}: stock restaurado → ${newStock}`);
@@ -400,6 +400,8 @@ app.delete('/api/productos/:id/variantes/:varId/links/:variant_id', (req, res) =
 app.post('/api/reserve', async (req, res) => {
   const { sessionId, variant_id, qty = 1 } = req.body;
   if (!sessionId || !variant_id) return res.status(400).json({ error: 'Faltan sessionId o variant_id' });
+  const clienteIP = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'IP desconocida';
+  const sessionShort = sessionId.slice(0, 8);
 
   // Buscar la variante interna que tenga este link
   const productos = db.get('productos').value();
@@ -453,7 +455,7 @@ app.post('/api/reserve', async (req, res) => {
       .assign({ stock: newStock }).get('log').unshift({
         ts: new Date().toISOString(), action: 'reserved',
         reservation_id: existing.id, session_id: sessionId,
-        delta: -extraQty, stock: newStock, reason: 'Reserva acumulada (mas unidades)'
+        delta: -extraQty, stock: newStock, reason: `Sesión ${sessionShort} · ${clienteIP} (acumulada)`
       }).write();
 
     syncVariante(foundProd.id, foundVar.id).catch(e => console.error('[RESERVAS] Sync error:', e.message));
@@ -477,7 +479,8 @@ app.post('/api/reserve', async (req, res) => {
     .assign({ stock: newStock }).get('log').unshift({
       ts: new Date().toISOString(), action: 'reserved',
       reservation_id: reservationId, session_id: sessionId,
-      delta: -parseInt(qty), stock: newStock, reason: 'Reserva de carrito (30 min)'
+      delta: -parseInt(qty), stock: newStock,
+      reason: `Sesión ${sessionShort} · ${clienteIP}`
     }).write();
 
   console.log(`[RESERVAS] Nueva: sesion ${sessionId} ${foundProd.nombre}/${foundVar.label} qty ${qty} | stock ${foundVar.stock} → ${newStock}`);
@@ -537,7 +540,8 @@ app.delete('/api/reserve/:sessionId', async (req, res) => {
     db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
       .assign({ stock: newStock }).get('log').unshift({
         ts: new Date().toISOString(), action: 'reservation_released',
-        reservation_id: r.id, delta: +r.qty, stock: newStock, reason: 'Reserva liberada'
+        reservation_id: r.id, delta: +r.qty, stock: newStock,
+        reason: `Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Carrito vaciado`
       }).write();
     syncVariante(r.productoId, r.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
   }
@@ -888,7 +892,7 @@ app.get('/api/stats', (req, res) => {
     sin_stock: todasVariantes.filter(v => v.stock === 0).length,
     active_reservations: activeReservations.length,
     recent_log: todasVariantes.flatMap(v => v.log.slice(0, 2).map(l => ({ ...l, producto: v.producto, variante: v.label })))
-      .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()).slice(0, 20)
+      .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()).slice(0, 100)
   });
 });
 
