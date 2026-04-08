@@ -801,7 +801,7 @@ app.put('/api/matchs/:id', async (req, res) => {
   const { nombre, precio, precio_promocional, imagen_url } = req.body;
   try {
     // Actualizar en TN
-    const tnBody: Record<string, unknown> = {};
+    const tnBody = {};
     if (nombre) tnBody.name = { es: nombre, en: nombre, pt: nombre };
     if (precio) tnBody.price = precio;
     if (precio_promocional) tnBody.promotional_price = precio_promocional;
@@ -810,7 +810,7 @@ app.put('/api/matchs/:id', async (req, res) => {
       await tnRequest('PUT', `/products/${match.tn_match_product_id}`, tnBody);
     }
     // Actualizar en DB local
-    const updates: Record<string, unknown> = {};
+    const updates = {};
     if (nombre) updates.nombre = nombre;
     if (precio) updates.precio = precio;
     if (precio_promocional) updates.precio_promocional = precio_promocional;
