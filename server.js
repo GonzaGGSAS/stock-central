@@ -588,11 +588,18 @@ app.post('/webhook/order', async (req, res) => {
 
     for (const item of order.products || []) {
       const { variant_id, quantity } = item;
+      // IMPORTANTE: releer la DB en cada iteración para evitar race conditions
+      // cuando dos items de la misma orden comparten el mismo SKU central
       const productos = db.get('productos').value();
       let foundProd = null, foundVar = null;
       for (const p of productos) {
         for (const v of p.variantes) {
-          if (v.links.some(l => l.variant_id === String(variant_id))) { foundProd = p; foundVar = v; break; }
+          if (v.links.some(l => l.variant_id === String(variant_id))) {
+            foundProd = p;
+            // Releer la variante directamente de la DB para tener el stock actualizado
+            foundVar = db.get('productos').find({ id: p.id }).get('variantes').find({ id: v.id }).value();
+            break;
+          }
         }
         if (foundProd) break;
       }
@@ -646,14 +653,16 @@ app.post('/webhook/order', async (req, res) => {
           console.log(`[WEBHOOK] Reserva ${match.id} convertida en venta (orden ${order_id})`);
         } else {
           // Sin reserva previa: descontar directamente
-          const newStock = Math.max(0, foundVar.stock - quantity);
+          // Releer el stock actual para evitar usar un valor cacheado
+          const currentVar = db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id }).value();
+          const newStock = Math.max(0, currentVar.stock - quantity);
           db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
             .assign({ stock: newStock }).get('log').unshift({
               ts: new Date().toISOString(), action: 'sale',
               order_id: String(order_id), delta: -quantity, stock: newStock, reason: 'Venta sin reserva previa'
             }).write();
           await syncVariante(foundProd.id, foundVar.id);
-          console.log(`[WEBHOOK] ${foundProd.nombre}/${foundVar.label}: ${foundVar.stock} → ${newStock}`);
+          console.log(`[WEBHOOK] ${foundProd.nombre}/${foundVar.label}: ${currentVar.stock} → ${newStock}`);
         }
 
       } else if (event === 'order/cancelled') {
