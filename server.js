@@ -641,25 +641,29 @@ app.post('/webhook/order', async (req, res) => {
           .filter(r => r.productoId === foundProd.id && r.varianteId === foundVar.id && r.expiresAt > now)
           .value();
 
+        // Siempre releer el stock actual antes de loguear
+        const currentVar = db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id }).value();
+
         if (activeRes.length > 0) {
           const match = activeRes.find(r => r.qty === quantity) || activeRes[0];
           db.get('reservations').remove({ id: match.id }).write();
+          // Stock ya fue descontado al reservar — solo registrar la venta con stock actual
           db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
             .get('log').unshift({
               ts: new Date().toISOString(), action: 'sale',
               order_id: String(order_id), reservation_id: match.id,
-              delta: -quantity, stock: foundVar.stock, reason: 'Venta confirmada (reserva existente)'
+              delta: -quantity, stock: currentVar.stock,
+              reason: `Venta confirmada — ${item.name || variant_id} (orden #${order_id})`
             }).write();
           console.log(`[WEBHOOK] Reserva ${match.id} convertida en venta (orden ${order_id})`);
         } else {
           // Sin reserva previa: descontar directamente
-          // Releer el stock actual para evitar usar un valor cacheado
-          const currentVar = db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id }).value();
           const newStock = Math.max(0, currentVar.stock - quantity);
           db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
             .assign({ stock: newStock }).get('log').unshift({
               ts: new Date().toISOString(), action: 'sale',
-              order_id: String(order_id), delta: -quantity, stock: newStock, reason: 'Venta sin reserva previa'
+              order_id: String(order_id), delta: -quantity, stock: newStock,
+              reason: `Venta — ${item.name || variant_id} (orden #${order_id})`
             }).write();
           await syncVariante(foundProd.id, foundVar.id);
           console.log(`[WEBHOOK] ${foundProd.nombre}/${foundVar.label}: ${currentVar.stock} → ${newStock}`);
