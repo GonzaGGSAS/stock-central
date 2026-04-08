@@ -585,6 +585,8 @@ app.post('/webhook/order', async (req, res) => {
       headers: { 'Authentication': `bearer ${access_token}`, 'User-Agent': 'StockCentral (soporte@minch.com.ar)' }
     });
     const order = await orderRes.json();
+    const clienteNombre = order.contact_name || (order.customer ? `${order.customer.name || ''} ${order.customer.last_name || ''}`.trim() : '') || 'Desconocido';
+    const clienteEmail = order.contact_email || order.customer?.email || '';
 
     for (const item of order.products || []) {
       const { variant_id, quantity } = item;
@@ -653,7 +655,7 @@ app.post('/webhook/order', async (req, res) => {
               ts: new Date().toISOString(), action: 'sale',
               order_id: String(order_id), reservation_id: match.id,
               delta: -quantity, stock: currentVar.stock,
-              reason: `Venta confirmada — ${item.name || variant_id} (orden #${order_id})`
+              reason: `${clienteNombre} — ${item.name || variant_id} (orden #${order_id})`
             }).write();
           console.log(`[WEBHOOK] Reserva ${match.id} convertida en venta (orden ${order_id})`);
         } else {
@@ -663,7 +665,7 @@ app.post('/webhook/order', async (req, res) => {
             .assign({ stock: newStock }).get('log').unshift({
               ts: new Date().toISOString(), action: 'sale',
               order_id: String(order_id), delta: -quantity, stock: newStock,
-              reason: `Venta — ${item.name || variant_id} (orden #${order_id})`
+              reason: `${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${item.name || variant_id} (orden #${order_id})`
             }).write();
           await syncVariante(foundProd.id, foundVar.id);
           console.log(`[WEBHOOK] ${foundProd.nombre}/${foundVar.label}: ${currentVar.stock} → ${newStock}`);
@@ -756,7 +758,9 @@ app.post('/api/matchs', async (req, res) => {
       tags: 'sc-match',
       attributes,
       variants: variantesBody,
-      published: true
+      published: true,
+      ...(req.body.precio ? { price: String(req.body.precio) } : {}),
+      ...(req.body.precio_promocional ? { promotional_price: String(req.body.precio_promocional) } : {}),
     };
 
     const tnProduct = await tnRequest('POST', '/products', productBody);
@@ -767,11 +771,19 @@ app.post('/api/matchs', async (req, res) => {
       id: 'match_' + Date.now(),
       nombre,
       tn_match_product_id: tnMatchProductId,
+      precio: req.body.precio || null,
+      precio_promocional: req.body.precio_promocional || null,
+      imagen_url: req.body.imagen_url || null,
       producto1: { tn_product_id: String(producto1.tn_product_id), nombre: p1name, variantes: v1list.map(v => ({ id: String(v.id), label: getLabel(v), stock: v.stock })) },
       producto2: { tn_product_id: String(producto2.tn_product_id), nombre: p2name, variantes: v2list.map(v => ({ id: String(v.id), label: getLabel(v), stock: v.stock })) },
       variantMap: variantMap.map((vm, i) => ({ ...vm, tn_variant_id: String(tnProduct.variants[i]?.id || '') })),
       createdAt: new Date().toISOString()
     };
+    
+    // Aplicar imagen si fue provista
+    if (req.body.imagen_url) {
+      tnRequest('PUT', `/products/${tnMatchProductId}`, { images: [{ src: req.body.imagen_url }] }).catch(e => console.warn('[MATCH] Error subiendo imagen:', e.message));
+    }
     db.get('matchs').push(nuevo).write();
     console.log(`[MATCH] Creado: ${nombre} | TN product: ${tnMatchProductId} | ${variantesBody.length} variantes`);
     res.json(nuevo);
