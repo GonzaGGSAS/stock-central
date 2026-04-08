@@ -795,6 +795,32 @@ app.get('/api/tn-product/:id/variants', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+app.put('/api/matchs/:id', async (req, res) => {
+  const match = db.get('matchs').find({ id: req.params.id }).value();
+  if (!match) return res.status(404).json({ error: 'Match no encontrado' });
+  const { nombre, precio, precio_promocional, imagen_url } = req.body;
+  try {
+    // Actualizar en TN
+    const tnBody: Record<string, unknown> = {};
+    if (nombre) tnBody.name = { es: nombre, en: nombre, pt: nombre };
+    if (precio) tnBody.price = precio;
+    if (precio_promocional) tnBody.promotional_price = precio_promocional;
+    if (imagen_url) tnBody.images = [{ src: imagen_url }];
+    if (Object.keys(tnBody).length > 0) {
+      await tnRequest('PUT', `/products/${match.tn_match_product_id}`, tnBody);
+    }
+    // Actualizar en DB local
+    const updates: Record<string, unknown> = {};
+    if (nombre) updates.nombre = nombre;
+    if (precio) updates.precio = precio;
+    if (precio_promocional) updates.precio_promocional = precio_promocional;
+    if (imagen_url) updates.imagen_url = imagen_url;
+    db.get('matchs').find({ id: req.params.id }).assign(updates).write();
+    const updated = db.get('matchs').find({ id: req.params.id }).value();
+    res.json(updated);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 app.delete('/api/matchs/:id', async (req, res) => {
   const match = db.get('matchs').find({ id: req.params.id }).value();
   if (!match) return res.status(404).json({ error: 'Match no encontrado' });
