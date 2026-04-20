@@ -789,6 +789,29 @@ app.post('/api/matchs', async (req, res) => {
     ];
 
     // Construir variantes combinadas
+    // TN no permite valores repetidos entre variantes de la misma propiedad
+    // Si los talles son iguales en ambos productos, prefijamos con inicial del producto
+    const v1Labels = new Set(v1list.map(v => getLabel(v)));
+    const v2Labels = new Set(v2list.map(v => getLabel(v)));
+    const hasConflict = [...v1Labels].some(l => v2Labels.has(l));
+
+    // Extraer el nombre entre comillas, ej: HOODIE "JACK" -> JACK
+    function extractQuotedName(name) {
+      const match = name.match(/"([^"]+)"/);
+      return match ? match[1] : name.split(' ').slice(-1)[0]; // fallback: última palabra
+    }
+    const p1short = extractQuotedName(p1name);
+    const p2short = extractQuotedName(p2name);
+
+    function getLabel1(v) {
+      const base = getLabel(v);
+      return hasConflict ? `${base} (${p1short})` : base;
+    }
+    function getLabel2(v) {
+      const base = getLabel(v);
+      return hasConflict ? `${base} (${p2short})` : base;
+    }
+
     const variantesBody = [];
     const variantMap = []; // para guardar el mapa v1id+v2id => variant
 
@@ -799,8 +822,8 @@ app.post('/api/matchs', async (req, res) => {
           v2.stock === null ? 9999 : v2.stock
         );
         variantesBody.push({
-          values: [getLabel(v1), getLabel(v2)],
-          price: null, // hereda del producto
+          values: [getLabel1(v1), getLabel2(v2)],
+          price: null,
           stock: stock === 9999 ? null : stock,
           weight: 1
         });
