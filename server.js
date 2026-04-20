@@ -381,6 +381,20 @@ app.delete('/api/productos/:id/variantes/:varId', (req, res) => {
   res.json({ ok: true });
 });
 
+// POST /api/sync-link — sincronizar un solo link (llamado desde el frontend link a link)
+app.post('/api/sync-link', async (req, res) => {
+  const { product_id, variant_id, stock } = req.body;
+  if (!product_id || !variant_id || stock === undefined) {
+    return res.status(400).json({ error: 'Faltan datos' });
+  }
+  try {
+    await tnRequest('PUT', `/products/${product_id}/variants/${variant_id}`, { stock });
+    res.json({ ok: true, variant_id, stock });
+  } catch (e) {
+    res.status(500).json({ ok: false, variant_id, error: e.message });
+  }
+});
+
 // POST /api/productos/:id/variantes/:varId/sync — sync con SSE progress
 app.post('/api/productos/:id/variantes/:varId/sync', async (req, res) => {
   const useSSE = req.headers.accept === 'text/event-stream';
