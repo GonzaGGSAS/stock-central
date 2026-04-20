@@ -43,22 +43,41 @@ async function tnRequest(method, path, body = null) {
 }
 
 // ─── Helper: Sync variante a Tiendanube ─────────────────────────────────────
-async function syncVariante(productoId, varianteId) {
+async function syncVariante(productoId, varianteId, onProgress) {
   const prod = db.get('productos').find({ id: productoId }).value();
   if (!prod) throw new Error('Producto no encontrado');
   const variante = prod.variantes.find(v => v.id === varianteId);
   if (!variante) throw new Error('Variante no encontrada');
   const errors = [];
-  for (const link of variante.links) {
-    try {
-      await tnRequest('PUT', `/products/${link.product_id}/variants/${link.variant_id}`, { stock: variante.stock });
-    } catch (e) { errors.push({ variant_id: link.variant_id, error: e.message }); }
+  let updated = 0;
+  for (let i = 0; i < variante.links.length; i++) {
+    const link = variante.links[i];
+    let success = false;
+    // Intentar hasta 2 veces
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        await tnRequest('PUT', `/products/${link.product_id}/variants/${link.variant_id}`, { stock: variante.stock });
+        success = true;
+        break;
+      } catch (e) {
+        if (attempt === 1) {
+          errors.push({ variant_id: link.variant_id, label: link.label, error: e.message });
+        } else {
+          await new Promise(r => setTimeout(r, 500)); // esperar antes del retry
+        }
+      }
+    }
+    if (success) updated++;
+    // Notificar progreso si hay listener
+    if (onProgress) onProgress({ current: i + 1, total: variante.links.length, label: link.label, ok: success });
+    // Pausa entre requests para evitar rate limit
+    if (i < variante.links.length - 1) await new Promise(r => setTimeout(r, 150));
   }
   db.get('productos').find({ id: productoId }).get('variantes').find({ id: varianteId }).get('log').unshift({
     ts: new Date().toISOString(), action: 'sync', stock: variante.stock,
-    links_updated: variante.links.length - errors.length, errors
+    links_updated: updated, errors: errors.length > 0 ? errors : undefined
   }).write();
-  return { ok: true, updated: variante.links.length - errors.length, errors };
+  return { ok: true, updated, total: variante.links.length, errors };
 }
 
 // ─── Helper: stock disponible (descontando reservas activas) ─────────────────
@@ -362,7 +381,26 @@ app.delete('/api/productos/:id/variantes/:varId', (req, res) => {
   res.json({ ok: true });
 });
 
+// POST /api/productos/:id/variantes/:varId/sync — sync con SSE progress
 app.post('/api/productos/:id/variantes/:varId/sync', async (req, res) => {
+  const useSSE = req.headers.accept === 'text/event-stream';
+  if (useSSE) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+    const sendEvent = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+    try {
+      const result = await syncVariante(req.params.id, req.params.varId, (progress) => {
+        sendEvent({ type: 'progress', ...progress });
+      });
+      sendEvent({ type: 'done', ...result });
+    } catch (e) {
+      sendEvent({ type: 'error', error: e.message });
+    }
+    res.end();
+    return;
+  }
   try { res.json(await syncVariante(req.params.id, req.params.varId)); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
