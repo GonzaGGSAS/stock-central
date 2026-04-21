@@ -774,12 +774,31 @@ app.post('/api/matchs', async (req, res) => {
     }
 
     // 2. Generar todas las combinaciones de variantes
-    function getLabel(v) {
-      if (v.values && v.values.length > 0) {
-        const val = v.values[0];
-        return val.es || val.en || Object.values(val)[0] || String(v.id);
+    // Detectar qué índices de atributos diferencian las variantes (ignorar los que son iguales en todas, ej: color único)
+    function getDifferentiatingIndices(variants) {
+      if (!variants[0]?.values?.length) return [];
+      const numAttrs = variants[0].values.length;
+      const indices = [];
+      for (let i = 0; i < numAttrs; i++) {
+        const uniqueValues = new Set(variants.map(v => {
+          const val = v.values[i];
+          return val?.es || val?.en || (val && Object.values(val)[0]) || '';
+        }));
+        if (uniqueValues.size > 1) indices.push(i);
       }
-      return v.sku || String(v.id);
+      return indices.length > 0 ? indices : [0]; // fallback: usar el primer atributo
+    }
+
+    const p1Indices = getDifferentiatingIndices(v1list);
+    const p2Indices = getDifferentiatingIndices(v2list);
+
+    function getLabel(v, indices) {
+      if (!v.values || v.values.length === 0) return v.sku || String(v.id);
+      const useIndices = indices || [0];
+      return useIndices.map(i => {
+        const val = v.values[i];
+        return val?.es || val?.en || (val && Object.values(val)[0]) || '';
+      }).filter(Boolean).join(' / ') || v.sku || String(v.id);
     }
 
     // 3. Crear producto contenedor en TN
@@ -791,8 +810,8 @@ app.post('/api/matchs', async (req, res) => {
     // Construir variantes combinadas
     // TN no permite valores repetidos entre variantes de la misma propiedad
     // Si los talles son iguales en ambos productos, prefijamos con inicial del producto
-    const v1Labels = new Set(v1list.map(v => getLabel(v)));
-    const v2Labels = new Set(v2list.map(v => getLabel(v)));
+    const v1Labels = new Set(v1list.map(v => getLabel(v, p1Indices)));
+    const v2Labels = new Set(v2list.map(v => getLabel(v, p2Indices)));
     const hasConflict = [...v1Labels].some(l => v2Labels.has(l));
 
     // Extraer el nombre entre comillas, ej: HOODIE "JACK" -> JACK
@@ -804,11 +823,11 @@ app.post('/api/matchs', async (req, res) => {
     const p2short = extractQuotedName(p2name);
 
     function getLabel1(v) {
-      const base = getLabel(v);
+      const base = getLabel(v, p1Indices);
       return hasConflict ? `${base} (${p1short})` : base;
     }
     function getLabel2(v) {
-      const base = getLabel(v);
+      const base = getLabel(v, p2Indices);
       return hasConflict ? `${base} (${p2short})` : base;
     }
 
@@ -827,7 +846,7 @@ app.post('/api/matchs', async (req, res) => {
           stock: stock === 9999 ? null : stock,
           weight: 1
         });
-        variantMap.push({ v1id: String(v1.id), v2id: String(v2.id), label: `${getLabel(v1)} / ${getLabel(v2)}` });
+        variantMap.push({ v1id: String(v1.id), v2id: String(v2.id), label: `${getLabel(v1, p1Indices)} / ${getLabel(v2, p2Indices)}` });
       }
     }
 
@@ -853,8 +872,8 @@ app.post('/api/matchs', async (req, res) => {
       precio: req.body.precio || null,
       precio_promocional: req.body.precio_promocional || null,
       imagen_url: req.body.imagen_url || null,
-      producto1: { tn_product_id: String(producto1.tn_product_id), nombre: p1name, variantes: v1list.map(v => ({ id: String(v.id), label: getLabel(v), stock: v.stock })) },
-      producto2: { tn_product_id: String(producto2.tn_product_id), nombre: p2name, variantes: v2list.map(v => ({ id: String(v.id), label: getLabel(v), stock: v.stock })) },
+      producto1: { tn_product_id: String(producto1.tn_product_id), nombre: p1name, variantes: v1list.map(v => ({ id: String(v.id), label: getLabel(v, p1Indices), stock: v.stock })) },
+      producto2: { tn_product_id: String(producto2.tn_product_id), nombre: p2name, variantes: v2list.map(v => ({ id: String(v.id), label: getLabel(v, p2Indices), stock: v.stock })) },
       variantMap: variantMap.map((vm, i) => ({ ...vm, tn_variant_id: String(tnProduct.variants[i]?.id || '') })),
       createdAt: new Date().toISOString()
     };
