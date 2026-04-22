@@ -616,7 +616,14 @@ app.get('/api/tn-products', async (req, res) => {
   try {
     let all = [], page = 1;
     while (true) {
-      const batch = await tnRequest('GET', `/products?per_page=50&page=${page}&fields=id,name,variants`);
+      let batch;
+      try {
+        batch = await tnRequest('GET', `/products?per_page=50&page=${page}&fields=id,name,variants`);
+      } catch (e) {
+        // TN responde "Last page is N" cuando se pide una página más allá de la última
+        if (/last page is/i.test(e.message)) break;
+        throw e;
+      }
       if (!Array.isArray(batch) || batch.length === 0) break;
       all = all.concat(batch);
       if (batch.length < 50) break;
