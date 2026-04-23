@@ -80,6 +80,10 @@ async function syncVariante(productoId, varianteId, onProgress) {
   return { ok: true, updated, total: variante.links.length, errors };
 }
 
+// ─── Helper: forzar número (corrige stocks guardados como string) ───────────
+// Bug histórico: si variante.stock quedó como string, "4" + 1 = "41" (concat)
+function toNum(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
+
 // ─── Helper: stock disponible (descontando reservas activas) ─────────────────
 function getAvailableStock(productoId, varianteId) {
   const prod = db.get('productos').find({ id: productoId }).value();
@@ -89,9 +93,9 @@ function getAvailableStock(productoId, varianteId) {
   const now = Date.now();
   const reservado = db.get('reservations')
     .filter(r => r.productoId === productoId && r.varianteId === varianteId && r.expiresAt > now)
-    .reduce((acc, r) => acc + r.qty, 0)
+    .reduce((acc, r) => acc + toNum(r.qty), 0)
     .value();
-  return Math.max(0, variante.stock - reservado);
+  return Math.max(0, toNum(variante.stock) - reservado);
 }
 
 // ─── Helper: buscar match por tn_variant_id del contenedor ─────────────────
@@ -136,13 +140,13 @@ async function reservarVarianteIndividual(sessionId, tn_variant_id, qty, matchRe
   }
 
   const reservationId = `res_match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-  const newStock = foundVar.stock - parseInt(qty);
+  const newStock = toNum(foundVar.stock) - toNum(qty);
 
   db.get('reservations').push({
     id: reservationId, sessionId,
     productoId: foundProd.id, varianteId: foundVar.id,
     tnVariantId: String(tn_variant_id),
-    qty: parseInt(qty), expiresAt: now + RESERVATION_MS,
+    qty: toNum(qty), expiresAt: now + RESERVATION_MS,
     matchReservationId: matchReservationId || null // para agrupar reservas del mismo match
   }).write();
 
@@ -170,11 +174,12 @@ setInterval(async () => {
     if (!prod) continue;
     const variante = prod.variantes.find(v => v.id === r.varianteId);
     if (!variante) continue;
-    const newStock = variante.stock + r.qty;
+    const qty = toNum(r.qty);
+    const newStock = toNum(variante.stock) + qty;
     db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
       .assign({ stock: newStock }).get('log').unshift({
         ts: new Date().toISOString(), action: 'reservation_expired',
-        reservation_id: r.id, delta: +r.qty, stock: newStock,
+        reservation_id: r.id, delta: +qty, stock: newStock,
         reason: `Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Expiró sin pago (30 min)`
       }).write();
     syncVariante(r.productoId, r.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
@@ -198,15 +203,15 @@ setInterval(async () => {
       try {
         const tnVariant = await tnRequest('GET', `/products/${link.product_id}/variants/${link.variant_id}`);
         chequeados++;
-        const tnStock = tnVariant.stock ?? null;
+        const tnStock = tnVariant.stock !== undefined && tnVariant.stock !== null ? toNum(tnVariant.stock) : null;
 
         // Si el stock en TN difiere del de Stock Central, corregir
-        if (tnStock !== null && tnStock !== variante.stock) {
+        if (tnStock !== null && tnStock !== toNum(variante.stock)) {
           console.log(`[RECONCILIAR] Discrepancia: ${prod.nombre}/${variante.label} | SC: ${variante.stock} | TN: ${tnStock} → corrigiendo SC`);
           db.get('productos').find({ id: prod.id }).get('variantes').find({ id: variante.id })
             .assign({ stock: tnStock }).get('log').unshift({
               ts: new Date().toISOString(), action: 'reconciled',
-              delta: tnStock - variante.stock, stock: tnStock,
+              delta: tnStock - toNum(variante.stock), stock: tnStock,
               reason: `Reconciliación automática (SC: ${variante.stock} → TN: ${tnStock})`
             }).write();
           corregidos++;
@@ -364,12 +369,13 @@ app.put('/api/productos/:id/variantes/:varId/stock', async (req, res) => {
   if (!prod) return res.status(404).json({ error: 'Producto no encontrado' });
   const variante = prod.variantes.find(v => v.id === varId);
   if (!variante) return res.status(404).json({ error: 'Variante no encontrada' });
-  let newStock = absolute !== undefined ? parseInt(absolute) : variante.stock + parseInt(delta);
+  const currentStock = toNum(variante.stock);
+  let newStock = absolute !== undefined ? toNum(absolute) : currentStock + toNum(delta);
   if (newStock < 0) newStock = 0;
   db.get('productos').find({ id }).get('variantes').find({ id: varId })
     .assign({ stock: newStock }).get('log').unshift({
-      ts: new Date().toISOString(), action: absolute !== undefined ? 'set' : delta > 0 ? 'add' : 'subtract',
-      delta: delta || (newStock - variante.stock), stock: newStock, reason: reason || ''
+      ts: new Date().toISOString(), action: absolute !== undefined ? 'set' : toNum(delta) > 0 ? 'add' : 'subtract',
+      delta: toNum(delta) || (newStock - currentStock), stock: newStock, reason: reason || ''
     }).write();
   let syncResult = null;
   if (sync) { try { syncResult = await syncVariante(id, varId); } catch (e) { syncResult = { ok: false, error: e.message }; } }
@@ -379,6 +385,30 @@ app.put('/api/productos/:id/variantes/:varId/stock', async (req, res) => {
 app.delete('/api/productos/:id/variantes/:varId', (req, res) => {
   db.get('productos').find({ id: req.params.id }).get('variantes').remove({ id: req.params.varId }).write();
   res.json({ ok: true });
+});
+
+// POST /api/admin/sanitize-stocks — recorrer toda la DB y forzar stocks numéricos
+// Soluciona corrupciones tipo "41-37" que quedaron por concatenación de strings
+app.post('/api/admin/sanitize-stocks', async (req, res) => {
+  const productos = db.get('productos').value();
+  const fixed = [];
+  for (const prod of productos) {
+    for (const variante of prod.variantes) {
+      const original = variante.stock;
+      const sanitized = toNum(original);
+      if (original !== sanitized) {
+        db.get('productos').find({ id: prod.id }).get('variantes').find({ id: variante.id })
+          .assign({ stock: sanitized }).get('log').unshift({
+            ts: new Date().toISOString(), action: 'sanitized',
+            delta: 0, stock: sanitized,
+            reason: `Saneo: valor corrupto "${original}" → ${sanitized} (revisar manualmente)`
+          }).write();
+        fixed.push({ producto: prod.nombre, variante: variante.label, original, sanitized });
+      }
+    }
+  }
+  console.log(`[ADMIN] Saneo: ${fixed.length} variantes corregidas`);
+  res.json({ ok: true, fixed_count: fixed.length, fixed });
 });
 
 // POST /api/sync-link — sincronizar un solo link (llamado desde el frontend link a link)
@@ -496,9 +526,9 @@ app.post('/api/reserve', async (req, res) => {
 
   if (existing) {
     // Sumar al stock reservado (misma prenda, misma sesion, mas unidades)
-    const extraQty = parseInt(qty);
-    const newQty = existing.qty + extraQty;
-    const newStock = foundVar.stock - extraQty;
+    const extraQty = toNum(qty);
+    const newQty = toNum(existing.qty) + extraQty;
+    const newStock = toNum(foundVar.stock) - extraQty;
 
     db.get('reservations').find({ id: existing.id })
       .assign({ qty: newQty, expiresAt: now + RESERVATION_MS }).write();
@@ -518,20 +548,20 @@ app.post('/api/reserve', async (req, res) => {
 
   // Nueva reserva — descontar del stock central
   const reservationId = `res_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-  const newStock = foundVar.stock - parseInt(qty);
+  const newStock = toNum(foundVar.stock) - toNum(qty);
 
   db.get('reservations').push({
     id: reservationId, sessionId,
     productoId: foundProd.id, varianteId: foundVar.id,
     tnVariantId: String(variant_id),
-    qty: parseInt(qty), expiresAt: now + RESERVATION_MS
+    qty: toNum(qty), expiresAt: now + RESERVATION_MS
   }).write();
 
   db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
     .assign({ stock: newStock }).get('log').unshift({
       ts: new Date().toISOString(), action: 'reserved',
       reservation_id: reservationId, session_id: sessionId,
-      delta: -parseInt(qty), stock: newStock,
+      delta: -toNum(qty), stock: newStock,
       reason: `Sesión ${sessionShort} · ${clienteIP}`
     }).write();
 
@@ -588,11 +618,12 @@ app.delete('/api/reserve/:sessionId', async (req, res) => {
     if (!prod) continue;
     const variante = prod.variantes.find(v => v.id === r.varianteId);
     if (!variante) continue;
-    const newStock = variante.stock + r.qty;
+    const qty = toNum(r.qty);
+    const newStock = toNum(variante.stock) + qty;
     db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
       .assign({ stock: newStock }).get('log').unshift({
         ts: new Date().toISOString(), action: 'reservation_released',
-        reservation_id: r.id, delta: +r.qty, stock: newStock,
+        reservation_id: r.id, delta: +qty, stock: newStock,
         reason: `Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Carrito vaciado`
       }).write();
     syncVariante(r.productoId, r.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
@@ -723,11 +754,11 @@ app.post('/webhook/order', async (req, res) => {
           console.log(`[WEBHOOK] Reserva ${match.id} convertida en venta (orden ${order_id})`);
         } else {
           // Sin reserva previa: descontar directamente
-          const newStock = Math.max(0, currentVar.stock - quantity);
+          const newStock = Math.max(0, toNum(currentVar.stock) - toNum(quantity));
           db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
             .assign({ stock: newStock }).get('log').unshift({
               ts: new Date().toISOString(), action: 'sale',
-              order_id: String(order_id), delta: -quantity, stock: newStock,
+              order_id: String(order_id), delta: -toNum(quantity), stock: newStock,
               reason: `${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${item.name || variant_id} (orden #${order_id})`
             }).write();
           await syncVariante(foundProd.id, foundVar.id);
@@ -735,11 +766,11 @@ app.post('/webhook/order', async (req, res) => {
         }
 
       } else if (event === 'order/cancelled') {
-        const newStock = foundVar.stock + quantity;
+        const newStock = toNum(foundVar.stock) + toNum(quantity);
         db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
           .assign({ stock: newStock }).get('log').unshift({
             ts: new Date().toISOString(), action: 'return',
-            order_id: String(order_id), delta: +quantity, stock: newStock
+            order_id: String(order_id), delta: +toNum(quantity), stock: newStock
           }).write();
         await syncVariante(foundProd.id, foundVar.id);
       }
