@@ -267,6 +267,42 @@ app.post('/api/config/webhook', async (req, res) => {
   } catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 
+// GET /api/admin/webhooks — listar webhooks registrados en TN
+app.get('/api/admin/webhooks', async (req, res) => {
+  try {
+    const hooks = await tnRequest('GET', '/webhooks');
+    res.json(hooks);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/webhooks/clean-and-register — borra todos los webhooks y los registra desde cero
+// Útil cuando hay duplicados o webhooks viejos apuntando a URLs que ya no existen
+app.post('/api/admin/webhooks/clean-and-register', async (req, res) => {
+  const { webhook_url } = req.body;
+  if (!webhook_url) return res.status(400).json({ error: 'Falta webhook_url' });
+  try {
+    // 1. Listar y borrar todos los webhooks existentes
+    const existing = await tnRequest('GET', '/webhooks');
+    const deleted = [];
+    for (const h of existing) {
+      try {
+        await tnRequest('DELETE', `/webhooks/${h.id}`);
+        deleted.push({ id: h.id, event: h.event, url: h.url });
+      } catch (e) { console.warn(`No se pudo borrar webhook ${h.id}:`, e.message); }
+    }
+    // 2. Registrar los 3 que necesitamos
+    const registered = [];
+    for (const event of ['order/created', 'order/paid', 'order/cancelled']) {
+      try {
+        const w = await tnRequest('POST', '/webhooks', { event, url: `${webhook_url}/webhook/order` });
+        registered.push({ event, id: w.id });
+      } catch (e) { registered.push({ event, error: e.message }); }
+    }
+    db.set('config.webhook_registered', true).write();
+    res.json({ ok: true, deleted, registered });
+  } catch (e) { res.status(500).json({ ok: false, error: e.message }); }
+});
+
 // ════════════════════════════════════════════════════════════════════════════
 // Productos
 // ════════════════════════════════════════════════════════════════════════════
