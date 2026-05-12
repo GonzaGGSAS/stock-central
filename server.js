@@ -183,15 +183,28 @@ setInterval(async () => {
     const variante = prod.variantes.find(v => v.id === r.varianteId);
     if (!variante) continue;
     const qty = toNum(r.qty);
-    const newStock = toNum(variante.stock) + qty;
-    db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
-      .assign({ stock: newStock }).get('log').unshift({
-        ts: new Date().toISOString(), action: 'reservation_expired',
-        reservation_id: r.id, delta: +qty, stock: newStock,
-        reason: `Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Expiró sin pago (30 min)`
-      }).write();
-    syncVariante(r.productoId, r.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
-    console.log(`[RESERVAS] ${r.productoId}/${r.varianteId}: stock restaurado → ${newStock}`);
+
+    if (r.matchReservationId) {
+      // Reserva de Match: SÍ se descontó stock al reservar, hay que devolverlo
+      const newStock = toNum(variante.stock) + qty;
+      db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
+        .assign({ stock: newStock }).get('log').unshift({
+          ts: new Date().toISOString(), action: 'reservation_expired',
+          reservation_id: r.id, delta: +qty, stock: newStock,
+          reason: `Match · Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Expiró sin pago (30 min)`
+        }).write();
+      syncVariante(r.productoId, r.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
+      console.log(`[RESERVAS] Match ${prod.nombre}/${variante.label}: stock restaurado → ${newStock}`);
+    } else {
+      // Reserva normal: NO se descontó stock, solo loguear el abandono
+      db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
+        .get('log').unshift({
+          ts: new Date().toISOString(), action: 'cart_expired',
+          reservation_id: r.id, delta: 0, stock: toNum(variante.stock),
+          reason: `Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Carrito abandonado (30 min)`
+        }).write();
+      console.log(`[RESERVAS] Carrito expirado (sin descuento): ${prod.nombre}/${variante.label}`);
+    }
   }
   db.get('reservations').remove(r => r.expiresAt <= now).write();
 }, 60 * 1000);
@@ -558,10 +571,10 @@ app.post('/api/reserve', async (req, res) => {
   }
 
   const now = Date.now();
-  const available = getAvailableStock(foundProd.id, foundVar.id);
 
-  if (available < qty) {
-    return res.status(409).json({ ok: false, error: 'Stock insuficiente', available });
+  // Validar stock disponible (TN será quien bloquee en checkout si llega a 0)
+  if (toNum(foundVar.stock) < toNum(qty)) {
+    return res.status(409).json({ ok: false, error: 'Stock insuficiente', available: toNum(foundVar.stock) });
   }
 
   // Verificar si ya existe reserva activa para esta sesion Y este variant_id especifico de TN
@@ -570,30 +583,28 @@ app.post('/api/reserve', async (req, res) => {
     .value();
 
   if (existing) {
-    // Sumar al stock reservado (misma prenda, misma sesion, mas unidades)
+    // Acumular qty (sin descontar stock — TN es la fuente de verdad para la concurrencia)
     const extraQty = toNum(qty);
     const newQty = toNum(existing.qty) + extraQty;
-    const newStock = toNum(foundVar.stock) - extraQty;
 
     db.get('reservations').find({ id: existing.id })
       .assign({ qty: newQty, expiresAt: now + RESERVATION_MS }).write();
 
     db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
-      .assign({ stock: newStock }).get('log').unshift({
-        ts: new Date().toISOString(), action: 'reserved',
+      .get('log').unshift({
+        ts: new Date().toISOString(), action: 'cart_added',
         reservation_id: existing.id, session_id: sessionId,
-        delta: -extraQty, stock: newStock, reason: `Sesión ${sessionShort} · ${clienteIP} (acumulada)`
+        delta: 0, stock: toNum(foundVar.stock),
+        reason: `Sesión ${sessionShort} · ${clienteIP} · +${extraQty} (carrito, qty ${newQty})`
       }).write();
 
-    syncVariante(foundProd.id, foundVar.id).catch(e => console.error('[RESERVAS] Sync error:', e.message));
-
-    console.log(`[RESERVAS] Acumulada: sesion ${sessionId} tnVariant ${variant_id} qty ${existing.qty}+${extraQty}=${newQty} | stock → ${newStock}`);
+    console.log(`[RESERVAS] Acumulada (sin descontar): sesion ${sessionId} tnVariant ${variant_id} qty ${existing.qty}+${extraQty}=${newQty}`);
     return res.json({ ok: true, managed: true, reservation_id: existing.id, updated: true });
   }
 
-  // Nueva reserva — descontar del stock central
+  // Nueva reserva — solo tracking, NO descontar stock ni sincronizar con TN
+  // Esto evita el bug donde TN bloqueaba al propio cliente que tiene el producto en su carrito
   const reservationId = `res_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-  const newStock = toNum(foundVar.stock) - toNum(qty);
 
   db.get('reservations').push({
     id: reservationId, sessionId,
@@ -603,17 +614,14 @@ app.post('/api/reserve', async (req, res) => {
   }).write();
 
   db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
-    .assign({ stock: newStock }).get('log').unshift({
-      ts: new Date().toISOString(), action: 'reserved',
+    .get('log').unshift({
+      ts: new Date().toISOString(), action: 'cart_added',
       reservation_id: reservationId, session_id: sessionId,
-      delta: -toNum(qty), stock: newStock,
-      reason: `Sesión ${sessionShort} · ${clienteIP}`
+      delta: 0, stock: toNum(foundVar.stock),
+      reason: `Sesión ${sessionShort} · ${clienteIP} · carrito (qty ${qty})`
     }).write();
 
-  console.log(`[RESERVAS] Nueva: sesion ${sessionId} ${foundProd.nombre}/${foundVar.label} qty ${qty} | stock ${foundVar.stock} → ${newStock}`);
-
-  // Sync a Tiendanube en background
-  syncVariante(foundProd.id, foundVar.id).catch(e => console.error('[RESERVAS] Sync error:', e.message));
+  console.log(`[RESERVAS] Nueva (sin descontar): sesion ${sessionId} ${foundProd.nombre}/${foundVar.label} qty ${qty}`);
 
   res.json({ ok: true, managed: true, reservation_id: reservationId });
 });
@@ -664,14 +672,26 @@ app.delete('/api/reserve/:sessionId', async (req, res) => {
     const variante = prod.variantes.find(v => v.id === r.varianteId);
     if (!variante) continue;
     const qty = toNum(r.qty);
-    const newStock = toNum(variante.stock) + qty;
-    db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
-      .assign({ stock: newStock }).get('log').unshift({
-        ts: new Date().toISOString(), action: 'reservation_released',
-        reservation_id: r.id, delta: +qty, stock: newStock,
-        reason: `Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Carrito vaciado`
-      }).write();
-    syncVariante(r.productoId, r.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
+
+    if (r.matchReservationId) {
+      // Reserva de Match: devolver stock a la variante individual
+      const newStock = toNum(variante.stock) + qty;
+      db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
+        .assign({ stock: newStock }).get('log').unshift({
+          ts: new Date().toISOString(), action: 'reservation_released',
+          reservation_id: r.id, delta: +qty, stock: newStock,
+          reason: `Match · Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Carrito vaciado`
+        }).write();
+      syncVariante(r.productoId, r.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
+    } else {
+      // Reserva normal: solo loguear, no se descontó stock al reservar
+      db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
+        .get('log').unshift({
+          ts: new Date().toISOString(), action: 'cart_released',
+          reservation_id: r.id, delta: 0, stock: toNum(variante.stock),
+          reason: `Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Carrito vaciado`
+        }).write();
+    }
   }
 
   if (variant_id) {
@@ -832,37 +852,30 @@ app.post('/webhook/order', async (req, res) => {
           continue;
         }
 
-        // Buscar reserva activa de carrito para convertirla en venta
+        // La reserva del carrito ya no descuenta stock (solo es tracking).
+        // Siempre hay que descontar al confirmar la orden, y de paso limpiar la reserva si existe.
         const now = Date.now();
         const activeRes = db.get('reservations')
           .filter(r => r.productoId === foundProd.id && r.varianteId === foundVar.id && r.expiresAt > now)
           .value();
 
-        if (activeRes.length > 0) {
-          // Reserva existente: el stock YA fue descontado al agregar al carrito
-          // Solo limpiar la reserva y registrar como venta confirmada
-          const match = activeRes.find(r => toNum(r.qty) === toNum(quantity)) || activeRes[0];
-          db.get('reservations').remove({ id: match.id }).write();
-          db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
-            .get('log').unshift({
-              ts: new Date().toISOString(), action: 'sale',
-              order_id: String(order_id), reservation_id: match.id,
-              delta: -toNum(quantity), stock: currentVar.stock,
-              reason: `${clienteNombre} — ${item.name || variant_id} (orden #${order_id})${paymentTag}`
-            }).write();
-          console.log(`[WEBHOOK] Reserva ${match.id} convertida en venta firme (orden ${order_id}, evento ${event})`);
-        } else {
-          // Sin reserva: descontar directo
-          const newStock = Math.max(0, toNum(currentVar.stock) - toNum(quantity));
-          db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
-            .assign({ stock: newStock }).get('log').unshift({
-              ts: new Date().toISOString(), action: 'sale',
-              order_id: String(order_id), delta: -toNum(quantity), stock: newStock,
-              reason: `${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${item.name || variant_id} (orden #${order_id})${paymentTag}`
-            }).write();
-          await syncVariante(foundProd.id, foundVar.id);
-          console.log(`[WEBHOOK] ${foundProd.nombre}/${foundVar.label}: ${currentVar.stock} → ${newStock} (evento ${event})`);
+        const matchedRes = activeRes.find(r => toNum(r.qty) === toNum(quantity)) || activeRes[0];
+        const newStock = Math.max(0, toNum(currentVar.stock) - toNum(quantity));
+
+        if (matchedRes) {
+          db.get('reservations').remove({ id: matchedRes.id }).write();
         }
+
+        db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
+          .assign({ stock: newStock }).get('log').unshift({
+            ts: new Date().toISOString(), action: 'sale',
+            order_id: String(order_id),
+            reservation_id: matchedRes ? matchedRes.id : undefined,
+            delta: -toNum(quantity), stock: newStock,
+            reason: `${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${item.name || variant_id} (orden #${order_id})${paymentTag}`
+          }).write();
+        await syncVariante(foundProd.id, foundVar.id);
+        console.log(`[WEBHOOK] ${foundProd.nombre}/${foundVar.label}: ${currentVar.stock} → ${newStock} (evento ${event}${matchedRes ? ', reserva consumida' : ''})`);
 
       } else if (event === 'order/cancelled') {
         // Solo devolver si esta orden previamente descontó stock
