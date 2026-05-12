@@ -1142,8 +1142,8 @@ app.get('/api/stats', (req, res) => {
     stock_bajo: todasVariantes.filter(v => v.stock <= 5 && v.stock > 0).length,
     sin_stock: todasVariantes.filter(v => v.stock === 0).length,
     active_reservations: activeReservations.length,
-    recent_log: todasVariantes.flatMap(v => v.log.slice(0, 2).map(l => ({ ...l, producto: v.producto, variante: v.label })))
-      .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()).slice(0, 100)
+    recent_log: todasVariantes.flatMap(v => v.log.slice(0, 20).map(l => ({ ...l, producto: v.producto, variante: v.label })))
+      .sort((a, b) => new Date(b.ts).getTime() - new Date(a.ts).getTime()).slice(0, 500)
   });
 });
 
