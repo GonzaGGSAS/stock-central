@@ -1187,18 +1187,29 @@ app.put('/api/matchs/:id/sync-stock', async (req, res) => {
 app.post('/api/admin/matchs/resync-all', async (req, res) => {
   const matchs = db.get('matchs').value();
   const results = [];
+  // Cache de productos individuales (un mismo BUZO suele estar en muchos combos)
+  const productCache = {}; // tn_product_id -> { variantId -> stock }
+
+  async function getProductVariants(tn_product_id) {
+    if (productCache[tn_product_id]) return productCache[tn_product_id];
+    const data = await tnRequest('GET', `/products/${tn_product_id}?fields=id,variants`);
+    const map = Object.fromEntries(data.variants.map(v => [String(v.id), toNum(v.stock)]));
+    productCache[tn_product_id] = map;
+    return map;
+  }
+
   for (const match of matchs) {
     if (!match.tn_match_product_id || !match.variantMap) {
       results.push({ id: match.id, nombre: match.nombre, skipped: true, reason: 'sin tn_match_product_id o variantMap' });
       continue;
     }
     try {
-      const [p1data, p2data] = await Promise.all([
-        tnRequest('GET', `/products/${match.producto1.tn_product_id}?fields=id,variants`),
-        tnRequest('GET', `/products/${match.producto2.tn_product_id}?fields=id,variants`)
-      ]);
-      const p1varMap = Object.fromEntries(p1data.variants.map(v => [String(v.id), toNum(v.stock)]));
-      const p2varMap = Object.fromEntries(p2data.variants.map(v => [String(v.id), toNum(v.stock)]));
+      // Reusar productos cacheados (suele estar el mismo BUZO en muchos combos)
+      const p1varMap = await getProductVariants(match.producto1.tn_product_id);
+      await new Promise(r => setTimeout(r, 400));
+      const p2varMap = await getProductVariants(match.producto2.tn_product_id);
+      await new Promise(r => setTimeout(r, 400));
+
       let updated = 0;
       const changes = [];
       for (const vm of match.variantMap) {
@@ -1206,24 +1217,34 @@ app.post('/api/admin/matchs/resync-all', async (req, res) => {
         const s2 = p2varMap[vm.v2id];
         if (s1 === undefined || s2 === undefined) continue;
         const newStock = Math.min(s1, s2);
-        // Obtener stock actual del contenedor antes de actualizar
-        const containerVar = await tnRequest('GET', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`).catch(() => null);
-        const oldStock = containerVar ? toNum(containerVar.stock) : null;
-        await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
-        if (oldStock !== newStock) changes.push({ label: vm.label, old: oldStock, new: newStock });
-        updated++;
-        await new Promise(r => setTimeout(r, 150));
+        // No hacemos GET del contenedor para ahorrar requests; TN ignora el PUT si el valor coincide
+        try {
+          await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
+          updated++;
+          changes.push({ label: vm.label, new: newStock });
+        } catch (e) {
+          // Si falla por rate limit, esperar y reintentar una vez
+          if (/too many requests/i.test(e.message)) {
+            await new Promise(r => setTimeout(r, 2000));
+            try {
+              await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
+              updated++;
+              changes.push({ label: vm.label, new: newStock });
+            } catch (e2) { throw e2; }
+          } else { throw e; }
+        }
+        await new Promise(r => setTimeout(r, 400));
       }
-      results.push({ id: match.id, nombre: match.nombre, updated, changes });
-      console.log(`[ADMIN-RESYNC] "${match.nombre}": ${updated} variantes, ${changes.length} con cambios`);
+      results.push({ id: match.id, nombre: match.nombre, updated, changes_count: changes.length });
+      console.log(`[ADMIN-RESYNC] "${match.nombre}": ${updated}/${match.variantMap.length} variantes actualizadas`);
     } catch (e) {
       results.push({ id: match.id, nombre: match.nombre, error: e.message });
       console.error(`[ADMIN-RESYNC] Error en "${match.nombre}":`, e.message);
     }
-    await new Promise(r => setTimeout(r, 300)); // pausa entre matchs
+    await new Promise(r => setTimeout(r, 800)); // pausa entre matchs
   }
-  const totalChanges = results.reduce((a, r) => a + (r.changes?.length || 0), 0);
-  res.json({ ok: true, total_matchs: matchs.length, processed: results.length, total_changes: totalChanges, results });
+  const totalUpdated = results.reduce((a, r) => a + (r.updated || 0), 0);
+  res.json({ ok: true, total_matchs: matchs.length, processed: results.length, total_updated: totalUpdated, results });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
