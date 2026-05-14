@@ -77,7 +77,63 @@ async function syncVariante(productoId, varianteId, onProgress) {
     ts: new Date().toISOString(), action: 'sync', stock: variante.stock,
     links_updated: updated, errors: errors.length > 0 ? errors : undefined
   }).write();
+
+  // ─── Re-sincronizar Matchs (combos) que contienen esta variante ─────────
+  // Cuando cambia el stock de un producto individual, los combos que lo incluyen
+  // también deben actualizar el stock de su contenedor en TN
+  try {
+    const affectedMatchs = await resyncMatchsForVariant(variante.links);
+    if (affectedMatchs.length > 0) {
+      console.log(`[SYNC] Matchs re-sincronizados: ${affectedMatchs.join(', ')}`);
+    }
+  } catch (e) {
+    console.error('[SYNC] Error re-sincronizando matchs:', e.message);
+  }
+
   return { ok: true, updated, total: variante.links.length, errors };
+}
+
+// ─── Helper: re-sincronizar todos los Matchs afectados por links ─────────────
+// Recibe un array de links (cada uno con variant_id) y actualiza el contenedor
+// en TN de cada Match que contenga alguna de esas variantes individuales
+async function resyncMatchsForVariant(links) {
+  if (!Array.isArray(links) || links.length === 0) return [];
+  const variantIds = new Set(links.map(l => String(l.variant_id)));
+  const matchs = db.get('matchs').value();
+  const affected = new Set(); // ids de matchs ya re-sincronizados (deduplicación)
+
+  for (const match of matchs) {
+    if (!match.variantMap || !match.tn_match_product_id) continue;
+    // Un match se ve afectado si alguno de sus v1id o v2id está en las variantes que cambiaron
+    const isAffected = match.variantMap.some(vm =>
+      variantIds.has(String(vm.v1id)) || variantIds.has(String(vm.v2id))
+    );
+    if (!isAffected || affected.has(match.id)) continue;
+    affected.add(match.id);
+
+    // Llamar la lógica de sync-stock para este match
+    try {
+      const [p1data, p2data] = await Promise.all([
+        tnRequest('GET', `/products/${match.producto1.tn_product_id}?fields=id,variants`),
+        tnRequest('GET', `/products/${match.producto2.tn_product_id}?fields=id,variants`)
+      ]);
+      const p1varMap = Object.fromEntries(p1data.variants.map(v => [String(v.id), toNum(v.stock)]));
+      const p2varMap = Object.fromEntries(p2data.variants.map(v => [String(v.id), toNum(v.stock)]));
+
+      for (const vm of match.variantMap) {
+        const s1 = p1varMap[vm.v1id];
+        const s2 = p2varMap[vm.v2id];
+        if (s1 === undefined || s2 === undefined) continue;
+        const newStock = Math.min(s1, s2);
+        await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
+        await new Promise(r => setTimeout(r, 150)); // rate limit
+      }
+      console.log(`[SYNC] Match "${match.nombre}" contenedor actualizado`);
+    } catch (e) {
+      console.error(`[SYNC] Error en match "${match.nombre}":`, e.message);
+    }
+  }
+  return Array.from(affected);
 }
 
 // ─── Helper: forzar número (corrige stocks guardados como string) ───────────
@@ -1124,6 +1180,50 @@ app.put('/api/matchs/:id/sync-stock', async (req, res) => {
     }
     res.json({ ok: true, updated });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/matchs/resync-all — re-sincronizar TODOS los matchs de una vez
+// Útil cuando se detecta desincronización entre productos individuales y sus contenedores
+app.post('/api/admin/matchs/resync-all', async (req, res) => {
+  const matchs = db.get('matchs').value();
+  const results = [];
+  for (const match of matchs) {
+    if (!match.tn_match_product_id || !match.variantMap) {
+      results.push({ id: match.id, nombre: match.nombre, skipped: true, reason: 'sin tn_match_product_id o variantMap' });
+      continue;
+    }
+    try {
+      const [p1data, p2data] = await Promise.all([
+        tnRequest('GET', `/products/${match.producto1.tn_product_id}?fields=id,variants`),
+        tnRequest('GET', `/products/${match.producto2.tn_product_id}?fields=id,variants`)
+      ]);
+      const p1varMap = Object.fromEntries(p1data.variants.map(v => [String(v.id), toNum(v.stock)]));
+      const p2varMap = Object.fromEntries(p2data.variants.map(v => [String(v.id), toNum(v.stock)]));
+      let updated = 0;
+      const changes = [];
+      for (const vm of match.variantMap) {
+        const s1 = p1varMap[vm.v1id];
+        const s2 = p2varMap[vm.v2id];
+        if (s1 === undefined || s2 === undefined) continue;
+        const newStock = Math.min(s1, s2);
+        // Obtener stock actual del contenedor antes de actualizar
+        const containerVar = await tnRequest('GET', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`).catch(() => null);
+        const oldStock = containerVar ? toNum(containerVar.stock) : null;
+        await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
+        if (oldStock !== newStock) changes.push({ label: vm.label, old: oldStock, new: newStock });
+        updated++;
+        await new Promise(r => setTimeout(r, 150));
+      }
+      results.push({ id: match.id, nombre: match.nombre, updated, changes });
+      console.log(`[ADMIN-RESYNC] "${match.nombre}": ${updated} variantes, ${changes.length} con cambios`);
+    } catch (e) {
+      results.push({ id: match.id, nombre: match.nombre, error: e.message });
+      console.error(`[ADMIN-RESYNC] Error en "${match.nombre}":`, e.message);
+    }
+    await new Promise(r => setTimeout(r, 300)); // pausa entre matchs
+  }
+  const totalChanges = results.reduce((a, r) => a + (r.changes?.length || 0), 0);
+  res.json({ ok: true, total_matchs: matchs.length, processed: results.length, total_changes: totalChanges, results });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
