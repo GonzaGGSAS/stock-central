@@ -366,6 +366,19 @@ setInterval(async () => {
 
   console.log(`[RECONCILIAR] Completado: ${chequeados} chequeados, ${corregidos} corregidos, ${errores} errores`);
 
+  // Agregar variantes faltantes a los matchs (ej: nuevos talles agregados a productos individuales)
+  console.log('[REPAIR-MATCHS] Iniciando reparación de variantes faltantes...');
+  try {
+    const r = await repairAllMatchVariants();
+    if (r.total_added > 0 || r.total_failed > 0) {
+      console.log(`[REPAIR-MATCHS] Completado: ${r.total_added} agregadas, ${r.total_failed} fallaron (de ${r.total_missing} faltantes)`);
+    } else {
+      console.log(`[REPAIR-MATCHS] Completado: sin variantes faltantes`);
+    }
+  } catch (e) {
+    console.error('[REPAIR-MATCHS] Error general:', e.message);
+  }
+
   // Re-sincronizar contenedores de matchs después de reconciliar productos individuales
   console.log('[RESYNC-MATCHS] Iniciando re-sincronización de contenedores...');
   try {
@@ -1263,11 +1276,11 @@ app.post('/api/admin/matchs/resync-all', async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// POST /api/admin/matchs/repair-variants — agrega variantes faltantes a los combos
-// Bug histórico: al crear un match se filtraban variantes con stock 0, que después
-// no se incluyen aunque recuperen stock. Este endpoint recorre cada match, detecta
-// qué combinaciones faltan en el contenedor y las crea en TN.
-app.post('/api/admin/matchs/repair-variants', async (req, res) => {
+// ─── Helper: agregar variantes faltantes a TODOS los matchs ─────────────────
+// Detecta combinaciones de variantes individuales que no están en cada contenedor
+// y las crea en TN. Bug histórico: al crear un match se filtraban variantes con
+// stock 0, y al agregar talles nuevos a un producto, los matchs viejos no los incluyen.
+async function repairAllMatchVariants() {
   const matchs = db.get('matchs').value();
   const results = [];
   const productCache = {};
@@ -1279,7 +1292,6 @@ app.post('/api/admin/matchs/repair-variants', async (req, res) => {
     return data;
   }
 
-  // Helpers copiados de la creación de match (deben mantenerse consistentes)
   function getDifferentiatingIndices(variants) {
     if (!variants[0]?.values?.length) return [];
     const numAttrs = variants[0].values.length;
@@ -1326,7 +1338,6 @@ app.post('/api/admin/matchs/repair-variants', async (req, res) => {
       const p1Indices = getDifferentiatingIndices(v1list);
       const p2Indices = getDifferentiatingIndices(v2list);
 
-      // Detectar si hubo conflicto al crear (mismos labels en ambos productos)
       const v1Labels = new Set(v1list.map(v => getLabel(v, p1Indices)));
       const v2Labels = new Set(v2list.map(v => getLabel(v, p2Indices)));
       const hasConflict = [...v1Labels].some(l => v2Labels.has(l));
@@ -1335,7 +1346,6 @@ app.post('/api/admin/matchs/repair-variants', async (req, res) => {
       const label1 = v => hasConflict ? `${getLabel(v, p1Indices)} (${p1short})` : getLabel(v, p1Indices);
       const label2 = v => hasConflict ? `${getLabel(v, p2Indices)} (${p2short})` : getLabel(v, p2Indices);
 
-      // Variantes que YA están en el match (por par v1id+v2id)
       const existingPairs = new Set(match.variantMap.map(vm => `${vm.v1id}|${vm.v2id}`));
       const missing = [];
       for (const v1 of v1list) {
@@ -1394,7 +1404,6 @@ app.post('/api/admin/matchs/repair-variants', async (req, res) => {
         await new Promise(r => setTimeout(r, 500));
       }
 
-      // Guardar el variantMap actualizado en la DB
       db.get('matchs').find({ id: match.id }).assign({ variantMap: newVariantMap }).write();
 
       results.push({
@@ -1405,7 +1414,9 @@ app.post('/api/admin/matchs/repair-variants', async (req, res) => {
         added_detail: added,
         failed_detail: failed
       });
-      console.log(`[REPAIR-MATCHS] "${match.nombre}": ${added.length}/${missing.length} variantes agregadas, ${failed.length} fallaron`);
+      if (added.length > 0 || failed.length > 0) {
+        console.log(`[REPAIR-MATCHS] "${match.nombre}": ${added.length}/${missing.length} variantes agregadas, ${failed.length} fallaron`);
+      }
     } catch (e) {
       results.push({ id: match.id, nombre: match.nombre, error: e.message });
       console.error(`[REPAIR-MATCHS] Error en "${match.nombre}":`, e.message);
@@ -1415,7 +1426,18 @@ app.post('/api/admin/matchs/repair-variants', async (req, res) => {
   const totalAdded = results.reduce((a, r) => a + (r.added || 0), 0);
   const totalFailed = results.reduce((a, r) => a + (r.failed || 0), 0);
   const totalMissing = results.reduce((a, r) => a + (r.missing || 0), 0);
-  res.json({ ok: true, total_matchs: matchs.length, total_missing: totalMissing, total_added: totalAdded, total_failed: totalFailed, results });
+  return { total_matchs: matchs.length, total_missing: totalMissing, total_added: totalAdded, total_failed: totalFailed, results };
+}
+
+// POST /api/admin/matchs/repair-variants — agrega variantes faltantes a los combos
+// Bug histórico: al crear un match se filtraban variantes con stock 0, que después
+// no se incluyen aunque recuperen stock. Este endpoint recorre cada match, detecta
+// qué combinaciones faltan en el contenedor y las crea en TN.
+app.post('/api/admin/matchs/repair-variants', async (req, res) => {
+  try {
+    const result = await repairAllMatchVariants();
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
