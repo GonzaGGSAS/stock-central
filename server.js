@@ -265,6 +265,67 @@ setInterval(async () => {
   db.get('reservations').remove(r => r.expiresAt <= now).write();
 }, 60 * 1000);
 
+// ─── Helper: re-sincronizar TODOS los matchs (compartido entre endpoint admin y cron) ─
+// Recorre cada Match, lee el stock real de los productos individuales en TN y
+// actualiza el stock del contenedor a min(s1, s2). Devuelve resumen de cambios.
+async function resyncAllMatchs() {
+  const matchs = db.get('matchs').value();
+  const results = [];
+  const productCache = {};
+
+  async function getProductVariants(tn_product_id) {
+    if (productCache[tn_product_id]) return productCache[tn_product_id];
+    const data = await tnRequest('GET', `/products/${tn_product_id}?fields=id,variants`);
+    const map = Object.fromEntries(data.variants.map(v => [String(v.id), toNum(v.stock)]));
+    productCache[tn_product_id] = map;
+    return map;
+  }
+
+  for (const match of matchs) {
+    if (!match.tn_match_product_id || !match.variantMap) {
+      results.push({ id: match.id, nombre: match.nombre, skipped: true, reason: 'sin tn_match_product_id o variantMap' });
+      continue;
+    }
+    try {
+      const p1varMap = await getProductVariants(match.producto1.tn_product_id);
+      await new Promise(r => setTimeout(r, 400));
+      const p2varMap = await getProductVariants(match.producto2.tn_product_id);
+      await new Promise(r => setTimeout(r, 400));
+
+      let updated = 0;
+      const changes = [];
+      for (const vm of match.variantMap) {
+        const s1 = p1varMap[vm.v1id];
+        const s2 = p2varMap[vm.v2id];
+        if (s1 === undefined || s2 === undefined) continue;
+        const newStock = Math.min(s1, s2);
+        try {
+          await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
+          updated++;
+          changes.push({ label: vm.label, new: newStock });
+        } catch (e) {
+          if (/too many requests/i.test(e.message)) {
+            await new Promise(r => setTimeout(r, 2000));
+            try {
+              await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
+              updated++;
+              changes.push({ label: vm.label, new: newStock });
+            } catch (e2) { throw e2; }
+          } else { throw e; }
+        }
+        await new Promise(r => setTimeout(r, 400));
+      }
+      results.push({ id: match.id, nombre: match.nombre, updated, changes_count: changes.length });
+    } catch (e) {
+      results.push({ id: match.id, nombre: match.nombre, error: e.message });
+      console.error(`[RESYNC-MATCHS] Error en "${match.nombre}":`, e.message);
+    }
+    await new Promise(r => setTimeout(r, 800));
+  }
+  const totalUpdated = results.reduce((a, r) => a + (r.updated || 0), 0);
+  return { total_matchs: matchs.length, processed: results.length, total_updated: totalUpdated, results };
+}
+
 // ─── Cron: reconciliar stock cada 6 horas ────────────────────────────────────
 setInterval(async () => {
   console.log('[RECONCILIAR] Iniciando chequeo de stock...');
@@ -304,6 +365,15 @@ setInterval(async () => {
   }
 
   console.log(`[RECONCILIAR] Completado: ${chequeados} chequeados, ${corregidos} corregidos, ${errores} errores`);
+
+  // Re-sincronizar contenedores de matchs después de reconciliar productos individuales
+  console.log('[RESYNC-MATCHS] Iniciando re-sincronización de contenedores...');
+  try {
+    const r = await resyncAllMatchs();
+    console.log(`[RESYNC-MATCHS] Completado: ${r.processed}/${r.total_matchs} matchs, ${r.total_updated} variantes actualizadas`);
+  } catch (e) {
+    console.error('[RESYNC-MATCHS] Error general:', e.message);
+  }
 }, 6 * 60 * 60 * 1000); // cada 6 horas
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -979,11 +1049,13 @@ app.post('/api/matchs', async (req, res) => {
     const p1name = producto1.nombre || (typeof p1data.name === 'object' ? p1data.name.es : p1data.name) || 'Producto 1';
     const p2name = producto2.nombre || (typeof p2data.name === 'object' ? p2data.name.es : p2data.name) || 'Producto 2';
 
-    const v1list = p1data.variants.filter(v => v.stock === null || v.stock > 0);
-    const v2list = p2data.variants.filter(v => v.stock === null || v.stock > 0);
+    // Incluir TODAS las variantes (incluso las que tienen stock 0)
+    // Filtrarlas excluiría talles que pueden recuperar stock después por devoluciones o nueva producción
+    const v1list = p1data.variants;
+    const v2list = p2data.variants;
 
     if (v1list.length === 0 || v2list.length === 0) {
-      return res.status(400).json({ error: 'Uno de los productos no tiene variantes con stock' });
+      return res.status(400).json({ error: 'Uno de los productos no tiene variantes' });
     }
 
     // 2. Generar todas las combinaciones de variantes
@@ -1185,66 +1257,165 @@ app.put('/api/matchs/:id/sync-stock', async (req, res) => {
 // POST /api/admin/matchs/resync-all — re-sincronizar TODOS los matchs de una vez
 // Útil cuando se detecta desincronización entre productos individuales y sus contenedores
 app.post('/api/admin/matchs/resync-all', async (req, res) => {
+  try {
+    const result = await resyncAllMatchs();
+    res.json({ ok: true, ...result });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST /api/admin/matchs/repair-variants — agrega variantes faltantes a los combos
+// Bug histórico: al crear un match se filtraban variantes con stock 0, que después
+// no se incluyen aunque recuperen stock. Este endpoint recorre cada match, detecta
+// qué combinaciones faltan en el contenedor y las crea en TN.
+app.post('/api/admin/matchs/repair-variants', async (req, res) => {
   const matchs = db.get('matchs').value();
   const results = [];
-  // Cache de productos individuales (un mismo BUZO suele estar en muchos combos)
-  const productCache = {}; // tn_product_id -> { variantId -> stock }
+  const productCache = {};
 
-  async function getProductVariants(tn_product_id) {
+  async function getProductFull(tn_product_id) {
     if (productCache[tn_product_id]) return productCache[tn_product_id];
-    const data = await tnRequest('GET', `/products/${tn_product_id}?fields=id,variants`);
-    const map = Object.fromEntries(data.variants.map(v => [String(v.id), toNum(v.stock)]));
-    productCache[tn_product_id] = map;
-    return map;
+    const data = await tnRequest('GET', `/products/${tn_product_id}?fields=id,name,variants`);
+    productCache[tn_product_id] = data;
+    return data;
+  }
+
+  // Helpers copiados de la creación de match (deben mantenerse consistentes)
+  function getDifferentiatingIndices(variants) {
+    if (!variants[0]?.values?.length) return [];
+    const numAttrs = variants[0].values.length;
+    const indices = [];
+    for (let i = 0; i < numAttrs; i++) {
+      const uniqueValues = new Set(variants.map(v => {
+        const val = v.values[i];
+        return val?.es || val?.en || (val && Object.values(val)[0]) || '';
+      }));
+      if (uniqueValues.size > 1) indices.push(i);
+    }
+    return indices.length > 0 ? indices : [0];
+  }
+  function getLabel(v, indices) {
+    if (!v.values || v.values.length === 0) return v.sku || String(v.id);
+    const useIndices = indices || [0];
+    return useIndices.map(i => {
+      const val = v.values[i];
+      return val?.es || val?.en || (val && Object.values(val)[0]) || '';
+    }).filter(Boolean).join(' / ') || v.sku || String(v.id);
+  }
+  function extractQuotedName(name) {
+    const match = name.match(/"([^"]+)"/);
+    return match ? match[1] : name.split(' ').slice(-1)[0];
   }
 
   for (const match of matchs) {
-    if (!match.tn_match_product_id || !match.variantMap) {
-      results.push({ id: match.id, nombre: match.nombre, skipped: true, reason: 'sin tn_match_product_id o variantMap' });
+    if (!match.tn_match_product_id || !match.variantMap || !match.producto1?.tn_product_id || !match.producto2?.tn_product_id) {
+      results.push({ id: match.id, nombre: match.nombre, skipped: true, reason: 'datos incompletos' });
       continue;
     }
     try {
-      // Reusar productos cacheados (suele estar el mismo BUZO en muchos combos)
-      const p1varMap = await getProductVariants(match.producto1.tn_product_id);
+      const p1full = await getProductFull(match.producto1.tn_product_id);
       await new Promise(r => setTimeout(r, 400));
-      const p2varMap = await getProductVariants(match.producto2.tn_product_id);
+      const p2full = await getProductFull(match.producto2.tn_product_id);
       await new Promise(r => setTimeout(r, 400));
 
-      let updated = 0;
-      const changes = [];
-      for (const vm of match.variantMap) {
-        const s1 = p1varMap[vm.v1id];
-        const s2 = p2varMap[vm.v2id];
-        if (s1 === undefined || s2 === undefined) continue;
-        const newStock = Math.min(s1, s2);
-        // No hacemos GET del contenedor para ahorrar requests; TN ignora el PUT si el valor coincide
+      const v1list = p1full.variants || [];
+      const v2list = p2full.variants || [];
+
+      const p1name = match.producto1.nombre || (typeof p1full.name === 'object' ? p1full.name.es : p1full.name) || 'Producto 1';
+      const p2name = match.producto2.nombre || (typeof p2full.name === 'object' ? p2full.name.es : p2full.name) || 'Producto 2';
+
+      const p1Indices = getDifferentiatingIndices(v1list);
+      const p2Indices = getDifferentiatingIndices(v2list);
+
+      // Detectar si hubo conflicto al crear (mismos labels en ambos productos)
+      const v1Labels = new Set(v1list.map(v => getLabel(v, p1Indices)));
+      const v2Labels = new Set(v2list.map(v => getLabel(v, p2Indices)));
+      const hasConflict = [...v1Labels].some(l => v2Labels.has(l));
+      const p1short = extractQuotedName(p1name);
+      const p2short = extractQuotedName(p2name);
+      const label1 = v => hasConflict ? `${getLabel(v, p1Indices)} (${p1short})` : getLabel(v, p1Indices);
+      const label2 = v => hasConflict ? `${getLabel(v, p2Indices)} (${p2short})` : getLabel(v, p2Indices);
+
+      // Variantes que YA están en el match (por par v1id+v2id)
+      const existingPairs = new Set(match.variantMap.map(vm => `${vm.v1id}|${vm.v2id}`));
+      const missing = [];
+      for (const v1 of v1list) {
+        for (const v2 of v2list) {
+          const key = `${v1.id}|${v2.id}`;
+          if (!existingPairs.has(key)) missing.push({ v1, v2 });
+        }
+      }
+
+      if (missing.length === 0) {
+        results.push({ id: match.id, nombre: match.nombre, missing: 0, added: 0 });
+        continue;
+      }
+
+      const added = [];
+      const failed = [];
+      const newVariantMap = [...match.variantMap];
+
+      for (const { v1, v2 } of missing) {
+        const stock = Math.min(
+          v1.stock === null || v1.stock === undefined ? 9999 : toNum(v1.stock),
+          v2.stock === null || v2.stock === undefined ? 9999 : toNum(v2.stock)
+        );
+        const variantBody = {
+          values: [label1(v1), label2(v2)],
+          price: null,
+          stock: stock === 9999 ? null : stock,
+          weight: 1
+        };
         try {
-          await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
-          updated++;
-          changes.push({ label: vm.label, new: newStock });
+          const created = await tnRequest('POST', `/products/${match.tn_match_product_id}/variants`, variantBody);
+          newVariantMap.push({
+            v1id: String(v1.id),
+            v2id: String(v2.id),
+            label: `${getLabel(v1, p1Indices)} / ${getLabel(v2, p2Indices)}`,
+            tn_variant_id: String(created.id || '')
+          });
+          added.push({ label: `${label1(v1)} + ${label2(v2)}`, stock, tn_variant_id: created.id });
         } catch (e) {
-          // Si falla por rate limit, esperar y reintentar una vez
           if (/too many requests/i.test(e.message)) {
             await new Promise(r => setTimeout(r, 2000));
             try {
-              await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
-              updated++;
-              changes.push({ label: vm.label, new: newStock });
-            } catch (e2) { throw e2; }
-          } else { throw e; }
+              const created = await tnRequest('POST', `/products/${match.tn_match_product_id}/variants`, variantBody);
+              newVariantMap.push({
+                v1id: String(v1.id),
+                v2id: String(v2.id),
+                label: `${getLabel(v1, p1Indices)} / ${getLabel(v2, p2Indices)}`,
+                tn_variant_id: String(created.id || '')
+              });
+              added.push({ label: `${label1(v1)} + ${label2(v2)}`, stock, tn_variant_id: created.id });
+            } catch (e2) { failed.push({ label: `${label1(v1)} + ${label2(v2)}`, error: e2.message }); }
+          } else {
+            failed.push({ label: `${label1(v1)} + ${label2(v2)}`, error: e.message });
+          }
         }
-        await new Promise(r => setTimeout(r, 400));
+        await new Promise(r => setTimeout(r, 500));
       }
-      results.push({ id: match.id, nombre: match.nombre, updated, changes_count: changes.length });
-      console.log(`[ADMIN-RESYNC] "${match.nombre}": ${updated}/${match.variantMap.length} variantes actualizadas`);
+
+      // Guardar el variantMap actualizado en la DB
+      db.get('matchs').find({ id: match.id }).assign({ variantMap: newVariantMap }).write();
+
+      results.push({
+        id: match.id, nombre: match.nombre,
+        missing: missing.length,
+        added: added.length,
+        failed: failed.length,
+        added_detail: added,
+        failed_detail: failed
+      });
+      console.log(`[REPAIR-MATCHS] "${match.nombre}": ${added.length}/${missing.length} variantes agregadas, ${failed.length} fallaron`);
     } catch (e) {
       results.push({ id: match.id, nombre: match.nombre, error: e.message });
-      console.error(`[ADMIN-RESYNC] Error en "${match.nombre}":`, e.message);
+      console.error(`[REPAIR-MATCHS] Error en "${match.nombre}":`, e.message);
     }
-    await new Promise(r => setTimeout(r, 800)); // pausa entre matchs
+    await new Promise(r => setTimeout(r, 800));
   }
-  const totalUpdated = results.reduce((a, r) => a + (r.updated || 0), 0);
-  res.json({ ok: true, total_matchs: matchs.length, processed: results.length, total_updated: totalUpdated, results });
+  const totalAdded = results.reduce((a, r) => a + (r.added || 0), 0);
+  const totalFailed = results.reduce((a, r) => a + (r.failed || 0), 0);
+  const totalMissing = results.reduce((a, r) => a + (r.missing || 0), 0);
+  res.json({ ok: true, total_matchs: matchs.length, total_missing: totalMissing, total_added: totalAdded, total_failed: totalFailed, results });
 });
 
 // ════════════════════════════════════════════════════════════════════════════
