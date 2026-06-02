@@ -906,65 +906,148 @@ app.post('/webhook/order', async (req, res) => {
       }
 
       // ─── Caso especial: variant es contenedor de un Match ────────────────
+      // Diseño: SC es fuente única de verdad. Buscamos los productos individuales
+      // del combo en SC (los buzos están dados de alta como productos gestionados),
+      // descontamos ahí, registramos en Actividad, y syncVariante propaga a TN.
       if (!foundProd || !foundVar) {
         const matchFound = db.get('matchs').find(m =>
           m.variantMap && m.variantMap.some(vm => vm.tn_variant_id === String(variant_id))
         ).value();
 
-        // Para matchs, descontamos en order/created (no en paid)
         if (matchFound && (event === 'order/created' || event === 'order/paid')) {
-          // Idempotencia básica: si llegó created y después paid, no duplicar
-          const matchLogKey = `match_${matchFound.id}_order_${order_id}`;
-          const alreadyProcessed = (matchFound._processedOrders || []).includes(String(order_id));
-          if (alreadyProcessed) {
-            console.log(`[WEBHOOK] Match ${matchFound.id} orden ${order_id} ya procesada, ignorando.`);
+          const vm = matchFound.variantMap.find(vm => vm.tn_variant_id === String(variant_id));
+
+          // Helper: encontrar producto/variante interno de SC a partir de tn_variant_id
+          const findInternal = (tnVarId) => {
+            for (const p of db.get('productos').value()) {
+              for (const v of p.variantes) {
+                if (v.links && v.links.some(l => String(l.variant_id) === String(tnVarId))) {
+                  return { productoId: p.id, varianteId: v.id, prod: p, variante: v };
+                }
+              }
+            }
+            return null;
+          };
+
+          const ind1 = findInternal(vm.v1id);
+          const ind2 = findInternal(vm.v2id);
+
+          // Idempotencia: si la orden ya descontó alguna de las dos variantes individuales, no repetir
+          const already1 = ind1 && orderAlreadyDiscounted(ind1.productoId, ind1.varianteId, order_id);
+          const already2 = ind2 && orderAlreadyDiscounted(ind2.productoId, ind2.varianteId, order_id);
+          if (already1 || already2) {
+            if (event === 'order/paid') {
+              console.log(`[WEBHOOK] Match orden ${order_id}: pago confirmado (stock ya descontado en order/created)`);
+            } else {
+              console.log(`[WEBHOOK] Match orden ${order_id} ya procesada, ignorando duplicado.`);
+            }
             continue;
           }
 
-          const vm = matchFound.variantMap.find(vm => vm.tn_variant_id === String(variant_id));
           console.log(`[WEBHOOK] Match detectado: ${matchFound.nombre} | variante: ${vm.label}${paymentTag}`);
-          await tnRequest('GET', `/products/${matchFound.producto1.tn_product_id}/variants/${vm.v1id}`)
-            .then(async v1 => {
-              const newStock1 = Math.max(0, toNum(v1.stock) - toNum(quantity));
-              await tnRequest('PUT', `/products/${matchFound.producto1.tn_product_id}/variants/${vm.v1id}`, { stock: newStock1 });
-              console.log(`[WEBHOOK] Match: Prod1 variante ${vm.v1id}: stock → ${newStock1}`);
-            }).catch(e => console.error('[WEBHOOK] Error descontando prod1:', e.message));
-          await tnRequest('GET', `/products/${matchFound.producto2.tn_product_id}/variants/${vm.v2id}`)
-            .then(async v2 => {
-              const newStock2 = Math.max(0, toNum(v2.stock) - toNum(quantity));
-              await tnRequest('PUT', `/products/${matchFound.producto2.tn_product_id}/variants/${vm.v2id}`, { stock: newStock2 });
-              console.log(`[WEBHOOK] Match: Prod2 variante ${vm.v2id}: stock → ${newStock2}`);
-            }).catch(e => console.error('[WEBHOOK] Error descontando prod2:', e.message));
+
+          // Descontar buzo 1 en SC
+          if (ind1) {
+            // Consumir reservas de match correspondientes (sin restaurar stock)
+            const now = Date.now();
+            const matchReservas = db.get('reservations')
+              .filter(r => r.productoId === ind1.productoId && r.varianteId === ind1.varianteId
+                        && r.matchReservationId && r.expiresAt > now)
+              .value();
+            for (const r of matchReservas) {
+              db.get('reservations').remove({ id: r.id }).write();
+            }
+            const currentStock1 = toNum(ind1.variante.stock);
+            const newStock1 = Math.max(0, currentStock1 - toNum(quantity));
+            db.get('productos').find({ id: ind1.productoId }).get('variantes').find({ id: ind1.varianteId })
+              .assign({ stock: newStock1 }).get('log').unshift({
+                ts: new Date().toISOString(), action: 'sale',
+                order_id: String(order_id),
+                delta: -toNum(quantity), stock: newStock1,
+                reason: `[MATCH ${matchFound.nombre}] ${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${vm.label} (orden #${order_id})${paymentTag}${matchReservas.length ? ' · reserva consumida' : ''}`
+              }).write();
+            await syncVariante(ind1.productoId, ind1.varianteId).catch(e => console.error('[WEBHOOK] Sync prod1:', e.message));
+            console.log(`[WEBHOOK] Match: ${ind1.prod.nombre}/${ind1.variante.label}: ${currentStock1} → ${newStock1}`);
+          } else {
+            console.warn(`[WEBHOOK] Match: prod1 variante ${vm.v1id} no encontrada en SC. Saltando descuento.`);
+          }
+
+          // Descontar buzo 2 en SC
+          if (ind2) {
+            const now = Date.now();
+            const matchReservas = db.get('reservations')
+              .filter(r => r.productoId === ind2.productoId && r.varianteId === ind2.varianteId
+                        && r.matchReservationId && r.expiresAt > now)
+              .value();
+            for (const r of matchReservas) {
+              db.get('reservations').remove({ id: r.id }).write();
+            }
+            const currentStock2 = toNum(ind2.variante.stock);
+            const newStock2 = Math.max(0, currentStock2 - toNum(quantity));
+            db.get('productos').find({ id: ind2.productoId }).get('variantes').find({ id: ind2.varianteId })
+              .assign({ stock: newStock2 }).get('log').unshift({
+                ts: new Date().toISOString(), action: 'sale',
+                order_id: String(order_id),
+                delta: -toNum(quantity), stock: newStock2,
+                reason: `[MATCH ${matchFound.nombre}] ${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${vm.label} (orden #${order_id})${paymentTag}${matchReservas.length ? ' · reserva consumida' : ''}`
+              }).write();
+            await syncVariante(ind2.productoId, ind2.varianteId).catch(e => console.error('[WEBHOOK] Sync prod2:', e.message));
+            console.log(`[WEBHOOK] Match: ${ind2.prod.nombre}/${ind2.variante.label}: ${currentStock2} → ${newStock2}`);
+          } else {
+            console.warn(`[WEBHOOK] Match: prod2 variante ${vm.v2id} no encontrada en SC. Saltando descuento.`);
+          }
+
+          // Re-sincronizar el contenedor del match (min de los dos)
           await fetch(`http://localhost:${process.env.PORT || 3001}/api/matchs/${matchFound.id}/sync-stock`, { method: 'PUT' }).catch(() => {});
 
-          // Marcar orden como procesada para este match
-          const processed = matchFound._processedOrders || [];
-          processed.push(String(order_id));
-          db.get('matchs').find({ id: matchFound.id }).assign({ _processedOrders: processed }).write();
         } else if (matchFound && event === 'order/cancelled') {
-          // Devolver stock al match si ya estaba procesada
-          const wasProcessed = (matchFound._processedOrders || []).includes(String(order_id));
-          if (!wasProcessed) {
-            console.log(`[WEBHOOK] Match ${matchFound.id} cancelación de orden ${order_id} no procesada previamente, ignorando.`);
+          const vm = matchFound.variantMap.find(vm => vm.tn_variant_id === String(variant_id));
+          const findInternal = (tnVarId) => {
+            for (const p of db.get('productos').value()) {
+              for (const v of p.variantes) {
+                if (v.links && v.links.some(l => String(l.variant_id) === String(tnVarId))) {
+                  return { productoId: p.id, varianteId: v.id, prod: p, variante: v };
+                }
+              }
+            }
+            return null;
+          };
+          const ind1 = findInternal(vm.v1id);
+          const ind2 = findInternal(vm.v2id);
+
+          // Solo devolver si la orden previamente descontó
+          const wasProc1 = ind1 && orderAlreadyDiscounted(ind1.productoId, ind1.varianteId, order_id);
+          const wasProc2 = ind2 && orderAlreadyDiscounted(ind2.productoId, ind2.varianteId, order_id);
+          if (!wasProc1 && !wasProc2) {
+            console.log(`[WEBHOOK] Match orden ${order_id} cancelada pero nunca descontó, ignorando.`);
             continue;
           }
-          const vm = matchFound.variantMap.find(vm => vm.tn_variant_id === String(variant_id));
-          await tnRequest('GET', `/products/${matchFound.producto1.tn_product_id}/variants/${vm.v1id}`)
-            .then(async v1 => {
-              const newStock1 = toNum(v1.stock) + toNum(quantity);
-              await tnRequest('PUT', `/products/${matchFound.producto1.tn_product_id}/variants/${vm.v1id}`, { stock: newStock1 });
-            }).catch(e => console.error('[WEBHOOK] Error devolviendo prod1:', e.message));
-          await tnRequest('GET', `/products/${matchFound.producto2.tn_product_id}/variants/${vm.v2id}`)
-            .then(async v2 => {
-              const newStock2 = toNum(v2.stock) + toNum(quantity);
-              await tnRequest('PUT', `/products/${matchFound.producto2.tn_product_id}/variants/${vm.v2id}`, { stock: newStock2 });
-            }).catch(e => console.error('[WEBHOOK] Error devolviendo prod2:', e.message));
+
+          if (ind1 && wasProc1) {
+            const newStock1 = toNum(ind1.variante.stock) + toNum(quantity);
+            db.get('productos').find({ id: ind1.productoId }).get('variantes').find({ id: ind1.varianteId })
+              .assign({ stock: newStock1 }).get('log').unshift({
+                ts: new Date().toISOString(), action: 'return',
+                order_id: String(order_id), delta: +toNum(quantity), stock: newStock1,
+                reason: `[MATCH ${matchFound.nombre}] Cancelación de orden #${order_id}${paymentTag}`
+              }).write();
+            await syncVariante(ind1.productoId, ind1.varianteId).catch(e => console.error('[WEBHOOK] Sync prod1:', e.message));
+            console.log(`[WEBHOOK] Match cancel: ${ind1.prod.nombre}/${ind1.variante.label}: stock devuelto → ${newStock1}`);
+          }
+          if (ind2 && wasProc2) {
+            const newStock2 = toNum(ind2.variante.stock) + toNum(quantity);
+            db.get('productos').find({ id: ind2.productoId }).get('variantes').find({ id: ind2.varianteId })
+              .assign({ stock: newStock2 }).get('log').unshift({
+                ts: new Date().toISOString(), action: 'return',
+                order_id: String(order_id), delta: +toNum(quantity), stock: newStock2,
+                reason: `[MATCH ${matchFound.nombre}] Cancelación de orden #${order_id}${paymentTag}`
+              }).write();
+            await syncVariante(ind2.productoId, ind2.varianteId).catch(e => console.error('[WEBHOOK] Sync prod2:', e.message));
+            console.log(`[WEBHOOK] Match cancel: ${ind2.prod.nombre}/${ind2.variante.label}: stock devuelto → ${newStock2}`);
+          }
           await fetch(`http://localhost:${process.env.PORT || 3001}/api/matchs/${matchFound.id}/sync-stock`, { method: 'PUT' }).catch(() => {});
-          // Quitar de procesadas
-          const processed = (matchFound._processedOrders || []).filter(o => o !== String(order_id));
-          db.get('matchs').find({ id: matchFound.id }).assign({ _processedOrders: processed }).write();
-          console.log(`[WEBHOOK] Match ${matchFound.id}: stock devuelto por cancelación de orden ${order_id}`);
-        } else {
+
+        } else if (!matchFound) {
           console.log(`[WEBHOOK] variant_id ${variant_id} no gestionada. Ignorado.`);
         }
         continue;
