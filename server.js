@@ -948,26 +948,30 @@ app.post('/webhook/order', async (req, res) => {
 
           // Descontar buzo 1 en SC
           if (ind1) {
-            // Consumir reservas de match correspondientes (sin restaurar stock)
+            // Buscar reservas de match: si existen, ya descontaron stock, hay que hacer rollback silencioso
+            // para que el descuento de la venta no sea doble.
             const now = Date.now();
             const matchReservas = db.get('reservations')
               .filter(r => r.productoId === ind1.productoId && r.varianteId === ind1.varianteId
                         && r.matchReservationId && r.expiresAt > now)
               .value();
+            let reservedQty = 0;
             for (const r of matchReservas) {
+              reservedQty += toNum(r.qty);
               db.get('reservations').remove({ id: r.id }).write();
             }
-            const currentStock1 = toNum(ind1.variante.stock);
-            const newStock1 = Math.max(0, currentStock1 - toNum(quantity));
+            // stockBefore = stock "real" antes de la reserva
+            const stockBefore = toNum(ind1.variante.stock) + reservedQty;
+            const newStock1 = Math.max(0, stockBefore - toNum(quantity));
             db.get('productos').find({ id: ind1.productoId }).get('variantes').find({ id: ind1.varianteId })
               .assign({ stock: newStock1 }).get('log').unshift({
                 ts: new Date().toISOString(), action: 'sale',
                 order_id: String(order_id),
                 delta: -toNum(quantity), stock: newStock1,
-                reason: `[MATCH ${matchFound.nombre}] ${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${vm.label} (orden #${order_id})${paymentTag}${matchReservas.length ? ' · reserva consumida' : ''}`
+                reason: `[MATCH ${matchFound.nombre}] ${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${vm.label} (orden #${order_id})${paymentTag}${reservedQty ? ` · reserva consumida (${reservedQty}u)` : ''}`
               }).write();
             await syncVariante(ind1.productoId, ind1.varianteId).catch(e => console.error('[WEBHOOK] Sync prod1:', e.message));
-            console.log(`[WEBHOOK] Match: ${ind1.prod.nombre}/${ind1.variante.label}: ${currentStock1} → ${newStock1}`);
+            console.log(`[WEBHOOK] Match: ${ind1.prod.nombre}/${ind1.variante.label}: ${stockBefore} → ${newStock1}${reservedQty ? ` (rollback reserva +${reservedQty})` : ''}`);
           } else {
             console.warn(`[WEBHOOK] Match: prod1 variante ${vm.v1id} no encontrada en SC. Saltando descuento.`);
           }
@@ -979,20 +983,22 @@ app.post('/webhook/order', async (req, res) => {
               .filter(r => r.productoId === ind2.productoId && r.varianteId === ind2.varianteId
                         && r.matchReservationId && r.expiresAt > now)
               .value();
+            let reservedQty = 0;
             for (const r of matchReservas) {
+              reservedQty += toNum(r.qty);
               db.get('reservations').remove({ id: r.id }).write();
             }
-            const currentStock2 = toNum(ind2.variante.stock);
-            const newStock2 = Math.max(0, currentStock2 - toNum(quantity));
+            const stockBefore = toNum(ind2.variante.stock) + reservedQty;
+            const newStock2 = Math.max(0, stockBefore - toNum(quantity));
             db.get('productos').find({ id: ind2.productoId }).get('variantes').find({ id: ind2.varianteId })
               .assign({ stock: newStock2 }).get('log').unshift({
                 ts: new Date().toISOString(), action: 'sale',
                 order_id: String(order_id),
                 delta: -toNum(quantity), stock: newStock2,
-                reason: `[MATCH ${matchFound.nombre}] ${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${vm.label} (orden #${order_id})${paymentTag}${matchReservas.length ? ' · reserva consumida' : ''}`
+                reason: `[MATCH ${matchFound.nombre}] ${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${vm.label} (orden #${order_id})${paymentTag}${reservedQty ? ` · reserva consumida (${reservedQty}u)` : ''}`
               }).write();
             await syncVariante(ind2.productoId, ind2.varianteId).catch(e => console.error('[WEBHOOK] Sync prod2:', e.message));
-            console.log(`[WEBHOOK] Match: ${ind2.prod.nombre}/${ind2.variante.label}: ${currentStock2} → ${newStock2}`);
+            console.log(`[WEBHOOK] Match: ${ind2.prod.nombre}/${ind2.variante.label}: ${stockBefore} → ${newStock2}${reservedQty ? ` (rollback reserva +${reservedQty})` : ''}`);
           } else {
             console.warn(`[WEBHOOK] Match: prod2 variante ${vm.v2id} no encontrada en SC. Saltando descuento.`);
           }
