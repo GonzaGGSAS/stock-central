@@ -141,11 +141,18 @@ async function resyncMatchsForVariant(links) {
 function toNum(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
 // ─── Helper: chequear si una orden ya descontó stock de una variante ────────
-// Evita doble descuento entre order/created y order/paid (idempotencia)
-function orderAlreadyDiscounted(productoId, varianteId, order_id) {
+// Evita doble descuento entre order/created y order/paid (idempotencia).
+// La key es (order_id + tn_variant_id): si una orden tiene 2 line items distintos
+// de TN que caen en la misma variante interna (mismo SKU compartido), ambos
+// deben descontarse; pero el retry del MISMO line item no debe repetir.
+function orderAlreadyDiscounted(productoId, varianteId, order_id, tn_variant_id) {
   const v = db.get('productos').find({ id: productoId }).get('variantes').find({ id: varianteId }).value();
   if (!v) return false;
-  return (v.log || []).some(e => e.order_id === String(order_id) && e.action === 'sale');
+  return (v.log || []).some(e =>
+    e.order_id === String(order_id) &&
+    e.action === 'sale' &&
+    (tn_variant_id == null || String(e.tn_variant_id || '') === String(tn_variant_id))
+  );
 }
 
 // ─── Helper: stock disponible (descontando reservas activas) ─────────────────
@@ -932,14 +939,16 @@ app.post('/webhook/order', async (req, res) => {
           const ind1 = findInternal(vm.v1id);
           const ind2 = findInternal(vm.v2id);
 
-          // Idempotencia: si la orden ya descontó alguna de las dos variantes individuales, no repetir
-          const already1 = ind1 && orderAlreadyDiscounted(ind1.productoId, ind1.varianteId, order_id);
-          const already2 = ind2 && orderAlreadyDiscounted(ind2.productoId, ind2.varianteId, order_id);
+          // Idempotencia: si la orden+variant_id del contenedor de este match ya descontó, no repetir.
+          // Guardamos el variant_id del combo (no del buzo individual) para diferenciar entre
+          // dos matchs distintos que compartan los mismos buzos individuales.
+          const already1 = ind1 && orderAlreadyDiscounted(ind1.productoId, ind1.varianteId, order_id, variant_id);
+          const already2 = ind2 && orderAlreadyDiscounted(ind2.productoId, ind2.varianteId, order_id, variant_id);
           if (already1 || already2) {
             if (event === 'order/paid') {
               console.log(`[WEBHOOK] Match orden ${order_id}: pago confirmado (stock ya descontado en order/created)`);
             } else {
-              console.log(`[WEBHOOK] Match orden ${order_id} ya procesada, ignorando duplicado.`);
+              console.log(`[WEBHOOK] Match orden ${order_id} line item ${variant_id} ya procesado, ignorando duplicado.`);
             }
             continue;
           }
@@ -967,6 +976,7 @@ app.post('/webhook/order', async (req, res) => {
               .assign({ stock: newStock1 }).get('log').unshift({
                 ts: new Date().toISOString(), action: 'sale',
                 order_id: String(order_id),
+                tn_variant_id: String(variant_id),
                 delta: -toNum(quantity), stock: newStock1,
                 reason: `[MATCH ${matchFound.nombre}] ${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${vm.label} (orden #${order_id})${paymentTag}${reservedQty ? ` · reserva consumida (${reservedQty}u)` : ''}`
               }).write();
@@ -994,6 +1004,7 @@ app.post('/webhook/order', async (req, res) => {
               .assign({ stock: newStock2 }).get('log').unshift({
                 ts: new Date().toISOString(), action: 'sale',
                 order_id: String(order_id),
+                tn_variant_id: String(variant_id),
                 delta: -toNum(quantity), stock: newStock2,
                 reason: `[MATCH ${matchFound.nombre}] ${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${vm.label} (orden #${order_id})${paymentTag}${reservedQty ? ` · reserva consumida (${reservedQty}u)` : ''}`
               }).write();
@@ -1021,11 +1032,11 @@ app.post('/webhook/order', async (req, res) => {
           const ind1 = findInternal(vm.v1id);
           const ind2 = findInternal(vm.v2id);
 
-          // Solo devolver si la orden previamente descontó
-          const wasProc1 = ind1 && orderAlreadyDiscounted(ind1.productoId, ind1.varianteId, order_id);
-          const wasProc2 = ind2 && orderAlreadyDiscounted(ind2.productoId, ind2.varianteId, order_id);
+          // Solo devolver si la orden+variant_id previamente descontó
+          const wasProc1 = ind1 && orderAlreadyDiscounted(ind1.productoId, ind1.varianteId, order_id, variant_id);
+          const wasProc2 = ind2 && orderAlreadyDiscounted(ind2.productoId, ind2.varianteId, order_id, variant_id);
           if (!wasProc1 && !wasProc2) {
-            console.log(`[WEBHOOK] Match orden ${order_id} cancelada pero nunca descontó, ignorando.`);
+            console.log(`[WEBHOOK] Match orden ${order_id} line item ${variant_id} cancelado pero nunca descontó, ignorando.`);
             continue;
           }
 
@@ -1063,8 +1074,10 @@ app.post('/webhook/order', async (req, res) => {
       const currentVar = db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id }).value();
 
       if (event === 'order/created' || event === 'order/paid') {
-        // Idempotencia: si esta orden ya descontó esta variante, no repetir
-        if (orderAlreadyDiscounted(foundProd.id, foundVar.id, order_id)) {
+        // Idempotencia: si esta orden+variant_id de TN ya descontó, no repetir.
+        // Uso variant_id de TN (no la variante interna) porque un mismo SKU puede
+        // estar linkeado a varios productos de TN, y cada line item debe descontar.
+        if (orderAlreadyDiscounted(foundProd.id, foundVar.id, order_id, variant_id)) {
           if (event === 'order/paid') {
             // Solo marcar el pago confirmado en el log (sin tocar stock)
             db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
@@ -1075,7 +1088,7 @@ app.post('/webhook/order', async (req, res) => {
               }).write();
             console.log(`[WEBHOOK] Pago confirmado para orden ${order_id} (stock ya descontado en order/created)`);
           } else {
-            console.log(`[WEBHOOK] Orden ${order_id} ya procesada para esta variante, ignorando duplicado.`);
+            console.log(`[WEBHOOK] Orden ${order_id} line item ${variant_id} ya procesado, ignorando duplicado.`);
           }
           continue;
         }
@@ -1098,6 +1111,7 @@ app.post('/webhook/order', async (req, res) => {
           .assign({ stock: newStock }).get('log').unshift({
             ts: new Date().toISOString(), action: 'sale',
             order_id: String(order_id),
+            tn_variant_id: String(variant_id),
             reservation_id: matchedRes ? matchedRes.id : undefined,
             delta: -toNum(quantity), stock: newStock,
             reason: `${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${item.name || variant_id} (orden #${order_id})${paymentTag}`
@@ -1106,9 +1120,9 @@ app.post('/webhook/order', async (req, res) => {
         console.log(`[WEBHOOK] ${foundProd.nombre}/${foundVar.label}: ${currentVar.stock} → ${newStock} (evento ${event}${matchedRes ? ', reserva consumida' : ''})`);
 
       } else if (event === 'order/cancelled') {
-        // Solo devolver si esta orden previamente descontó stock
-        if (!orderAlreadyDiscounted(foundProd.id, foundVar.id, order_id)) {
-          console.log(`[WEBHOOK] Orden ${order_id} cancelada pero nunca descontó ${foundProd.nombre}/${foundVar.label}, ignorando.`);
+        // Solo devolver si esta orden+variant_id previamente descontó stock
+        if (!orderAlreadyDiscounted(foundProd.id, foundVar.id, order_id, variant_id)) {
+          console.log(`[WEBHOOK] Orden ${order_id} line item ${variant_id} cancelado pero nunca descontó ${foundProd.nombre}/${foundVar.label}, ignorando.`);
           continue;
         }
         const newStock = toNum(currentVar.stock) + toNum(quantity);
