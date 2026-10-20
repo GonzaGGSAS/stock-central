@@ -2405,6 +2405,80 @@ app.post('/api/productos/import', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// Kit de prueba real: dos productos de TN (dos "diseños") que comparten 1 unidad
+// ════════════════════════════════════════════════════════════════════════════
+// Sirve para verificar en la tienda de verdad que el stock compartido no se sobrevende.
+// POST crea el kit, GET muestra el estado (SC + lo que tiene TN), DELETE borra todo.
+const TEST_KIT_ID = 'PRUEBA_SC';
+const TEST_KIT_PRICE = '999999';
+
+async function testKitStatus() {
+  const prod = db.get('productos').find({ id: TEST_KIT_ID }).value();
+  if (!prod) return { exists: false };
+  const v = prod.variantes[0];
+  const tn = [];
+  for (const l of v.links || []) {
+    try {
+      const p = await tnRequest('GET', `/products/${l.product_id}?fields=id,name,variants,published,handle,canonical_url`);
+      const tv = (p.variants || []).find(x => String(x.id) === String(l.variant_id));
+      tn.push({ label: l.label, product_id: l.product_id, variant_id: l.variant_id, tn_stock: tv ? tv.stock : 'no existe',
+        sc_pushed: l.tn_stock, url: p.canonical_url || null, published: p.published });
+    } catch (e) { tn.push({ label: l.label, product_id: l.product_id, error: e.message }); }
+  }
+  const alloc = allocation(prod.id, v.id);
+  return {
+    exists: true, productoId: prod.id, varianteId: v.id,
+    sc: { stock: alloc.stock, reservado: alloc.reserved, disponible: alloc.free },
+    holds: activeHolds(r => r.productoId === prod.id).map(h => ({ session: String(h.sessionId).slice(0, 8), canal: h.tnVariantId, qty: h.qty })),
+    tn, log: (v.log || []).slice(0, 15).map(e => ({ ts: e.ts, action: e.action, delta: e.delta, stock: e.stock, reason: e.reason }))
+  };
+}
+
+app.get('/api/admin/test-kit', async (req, res) => {
+  try { res.json(await testKitStatus()); } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+app.post('/api/admin/test-kit', async (req, res) => {
+  if (db.get('productos').find({ id: TEST_KIT_ID }).value()) return res.status(409).json({ error: 'El kit de prueba ya existe' });
+  try {
+    const now = new Date().toISOString();
+    const links = [];
+    for (const d of ['A', 'B']) {
+      const name = `PRUEBA SC · Diseño ${d} (no comprar)`;
+      const p = await tnRequest('POST', '/products', {
+        name: { es: name }, description: { es: 'Producto de prueba interna de Stock Central. No está a la venta.' },
+        published: true, tags: 'sc-prueba',
+        variants: [{ price: TEST_KIT_PRICE, stock: 1 }]
+      });
+      links.push({ product_id: String(p.id), variant_id: String(p.variants[0].id), label: name, linked_at: now });
+    }
+    db.get('productos').push({
+      id: TEST_KIT_ID, nombre: 'PRUEBA SC (stock compartido)',
+      variantes: [{ id: 'var_prueba', label: 'Única', stock: 1, links,
+        log: [{ ts: now, action: 'created', stock: 1, reason: 'Kit de prueba real' }] }]
+    }).write();
+    await syncVariante(TEST_KIT_ID, 'var_prueba', null, { force: true });
+    emitChange('stock', { productoId: TEST_KIT_ID });
+    res.json(await testKitStatus());
+  } catch (e) { res.status(500).json({ error: `No se pudo crear el kit: ${e.message}` }); }
+});
+
+app.delete('/api/admin/test-kit', async (req, res) => {
+  const prod = db.get('productos').find({ id: TEST_KIT_ID }).value();
+  if (!prod) return res.json({ ok: true, deleted: 0 });
+  const errors = [];
+  for (const l of prod.variantes[0].links || []) {
+    try { await tnRequest('DELETE', `/products/${l.product_id}`); }
+    catch (e) { if (e.status !== 404) errors.push({ product_id: l.product_id, error: e.message }); }
+  }
+  if (errors.length) return res.status(502).json({ error: 'No se pudieron borrar los productos de prueba en Tiendanube', errors });
+  db.get('productos').remove({ id: TEST_KIT_ID }).write();
+  db.get('reservations').remove(r => r.productoId === TEST_KIT_ID).write();
+  emitChange('stock', {});
+  res.json({ ok: true, deleted: 2 });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // Copias de seguridad de la base
 // ════════════════════════════════════════════════════════════════════════════
 // Una copia por día en <carpeta de la base>/backups (en Railway: el volumen /app/data),
