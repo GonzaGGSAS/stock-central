@@ -53,6 +53,7 @@ function onLive(ev) {
     case 'alerts': invalidate('alerts'); invalidate('overview'); break;
     case 'jobs': if (ev.jobId) pokeJob(ev.jobId); invalidate('jobs'); invalidate('overview'); break;
     case 'matchs': invalidate('matchs'); break;
+    case 'backups': invalidate('backups'); break;
     default: break;
   }
 }

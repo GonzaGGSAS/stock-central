@@ -256,6 +256,7 @@ export const GUIDES = {
       'Si dudás, tocá **Probar conexión**.',
       'Si dejan de llegar las ventas, andá al cuadro de avisos de pedidos (dice "Webhooks") y tocá **Limpiar y registrar**.',
       'En **Mantenimiento** hay tareas largas. Tocá **Ejecutar** y seguí usando el panel: corren solas.',
+      'En **Copias de seguridad**, una vez por semana tocá **Descargar copia** y guardá el archivo en tu compu o en Drive.',
       'Si usaste una compu prestada, tocá **Cerrar sesión en este navegador**.',
     ],
     ideas: [
@@ -267,11 +268,13 @@ export const GUIDES = {
       'Si los puntitos están en verde, dejá todo como está.',
       'Dejá correr las tareas hasta que terminen.',
       'Cerrá sesión si usaste una compu que no es tuya.',
+      'Descargá una copia de seguridad cada tanto y guardala fuera del panel.',
     ],
     no: [
       'No cambies los datos de la tienda si funciona.',
       'No toques **Limpiar y registrar** si las ventas llegan bien.',
       'No compartas la clave del panel con nadie.',
+      'No mandes el archivo de la copia por mail ni lo subas a lugares públicos: tiene los datos de tus clientes.',
       'No corras la misma tarea dos veces seguidas.',
     ],
     listas: [
