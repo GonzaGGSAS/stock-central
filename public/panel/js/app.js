@@ -9,6 +9,7 @@ import { storeInfo, DEFAULT_LOGO } from './lib/store-info.js';
 import { Icon } from './ui/icons.js';
 import { cx } from './ui/components.js';
 import { ToastHost, ConfirmHost } from './ui/overlay.js';
+import { GuidePanel, GuideToggle, useGuideColumn, guideIdFor } from './ui/guide.js';
 import { Inicio } from './views/inicio.js';
 import { Stock } from './views/stock.js';
 import { Combos } from './views/combos.js';
@@ -164,6 +165,7 @@ function App() {
   const ov = useCached('overview');
   const alertList = useCached('alerts');
   const alerts = Array.isArray(alertList) ? alertList.filter(x => !x.dismissed).length : ov?.alerts_open ?? 0;
+  const guideCol = useGuideColumn();
 
   useEffect(() => { document.title = `Stock Central · ${info.name || 'Minch'}`; }, [info.name]);
   useEffect(() => { window.scrollTo(0, 0); document.getElementById('main')?.focus({ preventScroll: true }); }, [r.view]);
@@ -183,12 +185,13 @@ function App() {
           <span class="brand-t">Stock Central</span>
         </a>
         <${Nav} view=${r.view} alerts=${alerts} />
-        <div class="top-right"><${JobsPill} /><${LiveDot} /></div>
+        <div class="top-right"><${JobsPill} /><${LiveDot} /><${GuideToggle} /></div>
       </div>
     </header>
     <${OfflineBanner} />
-    <main id="main" class="main" tabindex="-1">
+    <main id="main" class=${cx('main', guideCol && 'main-guide')} tabindex="-1">
       <${View} key=${r.view} query=${r.query} />
+      <${GuidePanel} key=${'g-' + r.view} id=${guideIdFor(r.view)} />
     </main>
     <${ToastHost} />
     <${ConfirmHost} />`;

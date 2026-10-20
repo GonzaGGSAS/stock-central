@@ -10,6 +10,7 @@ import { Icon } from '../ui/icons.js';
 import { Modal, toast, confirmDialog } from '../ui/overlay.js';
 import { TnPicker } from '../ui/tn-picker.js';
 import { ActivityFeed } from '../ui/activity-list.js';
+import { GuidePanel, GuideToggle, useGuideColumn } from '../ui/guide.js';
 
 const enc = encodeURIComponent;
 
@@ -152,6 +153,7 @@ function History({ p, v }) {
 
 export function VariantDrawer({ p, v, productos, onClose }) {
   const rs = useStore(rowState, (s) => (v ? s[v.id] : null));
+  const guideCol = useGuideColumn();
   if (!p || !v) {
     return html`<${Modal} side title="Variante no encontrada" onClose=${onClose}>
       <${Empty} icon="info" title="Esta variante ya no existe">Puede que la hayan borrado. Cerrá y buscala de nuevo.</${Empty}>
@@ -164,7 +166,9 @@ export function VariantDrawer({ p, v, productos, onClose }) {
     try { await deleteVariante(p.id, v.id); toast(`${v.label} borrada`); onClose(); }
     catch (e) { toast(`No se pudo borrar: ${e.message}`, { tone: 'bad' }); }
   };
-  return html`<${Modal} side title=${v.label} subtitle=${p.nombre} onClose=${onClose}>
+  return html`<${Modal} side title=${v.label} subtitle=${p.nombre} onClose=${onClose}
+    headExtra=${html`<${GuideToggle} where="drawer" />`}
+    aside=${html`<${GuidePanel} id="variante" where="drawer" />`} asideVisible=${guideCol}>
     <div class="dnums">
       <div class="dnum"><span class="stat-label">Disponible</span><span class=${'stat-value tone-' + tone}>${fmtNum(v.disponible)}</span></div>
       <div class="dnum"><span class="stat-label">Físico</span><span class="stat-value">${fmtNum(v.stock)}</span></div>

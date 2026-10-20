@@ -477,3 +477,96 @@ input:focus-visible, select:focus-visible, textarea:focus-visible { outline: non
 @media (max-width: 380px) {
   .stats { grid-template-columns: 1fr; }
 }
+
+/* ─── Guía de ayuda (columna al costado / hoja en el celular) ───────────── */
+:root { --guide-w: 340px; }
+.main-guide { max-width: 1500px; display: grid; grid-template-columns: minmax(0, 1fr) var(--guide-w); gap: 24px; align-items: start; }
+.main-guide > .view { min-width: 0; }
+.guide-toggle { gap: 6px; }
+.guide-toggle-on { background: var(--n-3); border-color: var(--n-4); }
+
+.guide { background: var(--n-1); border: 1px solid var(--n-3); border-radius: var(--r); display: flex; flex-direction: column; min-width: 0; animation: fade .2s ease; }
+.guide-page { position: sticky; top: calc(var(--top-h) + 16px); max-height: calc(100vh - var(--top-h) - 32px); overflow-y: auto; overscroll-behavior: contain; }
+.dlg-side > .guide-drawer { order: -1; flex: none; width: var(--guide-w); max-width: 40vw; height: 100%; overflow-y: auto; overscroll-behavior: contain; border-radius: 0; border-width: 0 0 0 1px; animation: slidein .25s var(--ease); }
+.guide-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: flex-start; gap: 10px; padding: 14px 14px 10px; background: var(--n-1); border-bottom: 1px solid var(--n-3); }
+.guide-titles { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.guide-titles h2 { font-size: 17px; overflow-wrap: anywhere; }
+.guide-kicker { font-size: 11px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; color: var(--n-5); }
+.guide-body { padding: 14px; display: flex; flex-direction: column; gap: 18px; font-size: 14px; line-height: 1.5; color: var(--n-6); overflow-wrap: anywhere; }
+.guide-body strong { color: var(--n-7); font-weight: 650; }
+.guide-hero { margin: 0; padding: 10px; display: flex; justify-content: center; background: var(--n-0); border: 1px solid var(--n-3); border-radius: var(--r-sm); }
+.guide-sec { display: flex; flex-direction: column; gap: 8px; }
+.guide-sec h3 { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; font-size: 14px; color: var(--n-7); }
+.guide-sec p + p { margin-top: 2px; }
+.guide-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 9px; }
+.guide-steps li { display: grid; grid-template-columns: 24px minmax(0, 1fr); gap: 9px; align-items: start; }
+.guide-step-n { width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; background: var(--n-3); color: var(--n-7); font-size: 12px; font-weight: 750; }
+.guide-ideas { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.guide-idea { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 10px; align-items: center; padding: 8px 10px 8px 6px; background: var(--n-0); border: 1px solid var(--n-3); border-radius: var(--r-sm); }
+.guide-idea p { font-size: 13px; margin-top: 2px; }
+.guide-yes, .guide-no { padding: 10px 12px 12px; border: 1px solid; border-radius: var(--r-sm); }
+.guide-yes { background: var(--ok-soft); border-color: var(--ok-line); }
+.guide-no { background: var(--bad-soft); border-color: var(--bad-line); }
+.guide-yes h3 { color: var(--ok); }
+.guide-no h3 { color: var(--bad); }
+.guide-mark { font-size: 15px; }
+.guide-h-sub { font-size: 12px; font-weight: 600; color: var(--n-6); }
+.guide-yes ul, .guide-no ul { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px; color: var(--n-7); }
+.guide-legend { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 9px; }
+.guide-legend li { display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 10px; align-items: start; }
+.guide-legend li.guide-leg-pill, .guide-legend li.guide-leg-text { grid-template-columns: minmax(0, 1fr); gap: 3px; }
+.guide-sample { display: flex; justify-content: center; align-items: center; min-height: 21px; }
+.guide-leg-pill .guide-sample, .guide-leg-text .guide-sample { justify-content: flex-start; }
+.guide-sample .dot { width: 12px; height: 12px; }
+.guide-num { font-size: 21px; font-weight: 750; line-height: 1; color: var(--n-7); }
+.guide-sample-t { font-size: 13px; font-weight: 650; }
+
+/* Dibujos: solo los 4 colores del panel */
+.gart { display: block; width: 100%; max-width: 240px; height: auto; }
+.gart-sm { max-width: 96px; }
+.gart .gs { fill: none; stroke: var(--n-6); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.gart .gs-n { stroke: var(--n-6); }
+.gart .gs-ok { stroke: var(--ok); }
+.gart .gs-warn { stroke: var(--warn); }
+.gart .gs-bad { stroke: var(--bad); }
+.gart .gs-dash { stroke-dasharray: 4 4; }
+.gart .gs-thick { stroke-width: 4; }
+.gart .gf-n { fill: var(--n-2); }
+.gart .gf-ok { fill: var(--ok-soft); }
+.gart .gf-warn { fill: var(--warn-soft); }
+.gart .gf-bad { fill: var(--bad-soft); }
+.gart .gfs-ok { fill: var(--ok); }
+.gart .gfs-warn { fill: var(--warn); }
+.gart .gfs-bad { fill: var(--bad); }
+.gart .gt { font-family: var(--font); font-weight: 800; fill: var(--n-7); }
+.gart .gt-n { fill: var(--n-7); }
+.gart .gt-ok { fill: var(--ok); }
+.gart .gt-warn { fill: var(--warn); }
+.gart .gt-bad { fill: var(--bad); }
+.gart .gt-muted { fill: var(--n-5); font-weight: 650; }
+.gart .gt-ink { fill: var(--n-0); }
+
+/* Celular: botón flotante "?" y hoja desde abajo */
+.guide-fab { position: fixed; right: 16px; bottom: calc(16px + env(safe-area-inset-bottom)); z-index: 35; width: 52px; height: 52px; border-radius: 50%;
+  display: inline-flex; align-items: center; justify-content: center; border: 1px solid var(--n-7); background: var(--n-7); color: var(--n-0);
+  font-size: 24px; font-weight: 800; line-height: 1; cursor: pointer; box-shadow: 0 8px 24px rgba(0,0,0,.45); transition: transform .08s; }
+.guide-fab:active { transform: translateY(1px); }
+.guide-fab:focus-visible { outline: 2px solid var(--n-7); outline-offset: 3px; border-radius: 50%; }
+.guide-sheet-wrap { position: fixed; inset: 0; z-index: 70; display: flex; align-items: flex-end; background: color-mix(in srgb, #000 62%, transparent); animation: fade .15s ease; }
+.guide-sheet { width: 100%; max-height: 88vh; overflow-y: auto; overscroll-behavior: contain; background: var(--n-1); border-top: 1px solid var(--n-4); border-radius: 16px 16px 0 0; animation: slideup .25s var(--ease); }
+.guide-sheet:focus { outline: none; }
+.guide-sheet .guide-head { border-radius: 16px 16px 0 0; }
+.guide-sheet-foot { display: flex; padding: 0 14px calc(16px + env(safe-area-inset-bottom)); }
+.guide-sheet-foot .btn { flex: 1; }
+
+@media (max-width: 1099px) {
+  :root { --guide-w: 300px; }
+  .main-guide { gap: 16px; }
+}
+@media (max-width: 767px) {
+  .main { padding-bottom: 88px; } /* que lo último no quede debajo del botón "?" */
+}
+@media (max-width: 760px) {
+  .guide-fab { bottom: calc(var(--nav-h) + 14px + env(safe-area-inset-bottom)); }
+  .main { padding-bottom: calc(var(--nav-h) + 84px + env(safe-area-inset-bottom)); }
+}
