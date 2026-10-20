@@ -29,6 +29,8 @@ db.defaults({
 const app = express();
 app.use(cors());
 app.use(bodyParser.json());
+// Panel web (public/panel) servido en la raíz
+app.use(express.static(path.join(__dirname, 'public', 'panel')));
 const PORT = process.env.PORT || 3001;
 const RESERVATION_MS = 30 * 60 * 1000; // 30 minutos
 
@@ -922,10 +924,16 @@ app.get('/api/tn-products', async (req, res) => {
 
 app.post('/webhook/order', async (req, res) => {
   res.sendStatus(200);
-  const { event, id: order_id, store_id } = req.body;
+  const { event, id: order_id } = req.body || {};
+  processOrderEvent(event, order_id).catch(e => console.error('[WEBHOOK] Error:', e.message));
+});
+
+// Procesa un evento de orden (order/created | order/paid | order/cancelled).
+// Separado del endpoint para poder esperarlo (tests, catch-up de órdenes).
+async function processOrderEvent(event, order_id, preloadedOrder) {
   console.log(`[WEBHOOK] ${event} | Orden: ${order_id}`);
-  try {
-    const order = await tnRequest('GET', `/orders/${order_id}`);
+  {
+    const order = preloadedOrder || await tnRequest('GET', `/orders/${order_id}`);
     const clienteNombre = order.contact_name || (order.customer ? `${order.customer.name || ''} ${order.customer.last_name || ''}`.trim() : '') || 'Desconocido';
     const clienteEmail = order.contact_email || order.customer?.email || '';
     // Detectar método de pago para distinguir transferencias en el log
@@ -1172,8 +1180,8 @@ app.post('/webhook/order', async (req, res) => {
         console.log(`[WEBHOOK] ${foundProd.nombre}/${foundVar.label}: stock devuelto por cancelación → ${newStock}`);
       }
     }
-  } catch (e) { console.error('[WEBHOOK] Error:', e.message); }
-});
+  }
+}
 
 app.post('/webhook/privacy', (req, res) => res.sendStatus(200));
 
@@ -1624,4 +1632,4 @@ if (require.main === module) {
   startBackgroundJobs();
 }
 
-module.exports = { app, db, toNum, tnRequest, syncVariante, syncMatchStock, releaseExpiredReservations, runReconcileCycle, resyncAllMatchs, repairAllMatchVariants };
+module.exports = { app, db, processOrderEvent, toNum, tnRequest, syncVariante, syncMatchStock, releaseExpiredReservations, runReconcileCycle, resyncAllMatchs, repairAllMatchVariants };
