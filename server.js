@@ -58,7 +58,7 @@ app.use((req, res, next) => {
   const p = req.path.toLowerCase().replace(/\/+$/, '') || '/';
   if (!ADMIN_TOKEN || !(p === '/api' || p.startsWith('/api/')) || req.method === 'OPTIONS') return next();
   if (p === '/api/health') return next();
-  if ((p === '/api/reserve' || p === '/api/reservations') && req.method === 'POST') return next();
+  if ((p === '/api/reserve' || p === '/api/reserve/sync' || p === '/api/reservations') && req.method === 'POST') return next();
   if ((p.startsWith('/api/reserve/') || p.startsWith('/api/reservations/')) && req.method === 'DELETE') return next();
   const h = String(req.headers.authorization || '');
   const token = h.startsWith('Bearer ') ? h.slice(7) : String(req.query.token || '');
@@ -66,7 +66,9 @@ app.use((req, res, next) => {
   res.status(401).json({ error: 'No autorizado', code: 'unauthorized' });
 });
 const PORT = process.env.PORT || 3001;
-const RESERVATION_MS = 30 * 60 * 1000; // 30 minutos
+// Cuánto se retiene una unidad en un carrito sin actividad (el storefront renueva en cada página)
+const HOLD_MINUTES = Math.max(1, toNum(process.env.SC_HOLD_MINUTES) || 15);
+const RESERVATION_MS = HOLD_MINUTES * 60 * 1000;
 
 // ─── Helper: API Tiendanube ──────────────────────────────────────────────────
 // Rate limit de TN: leaky bucket de 40 requests que se vacía a 2 por segundo.
@@ -528,7 +530,7 @@ function placeHolds(sessionId, sides, channel, meta = {}) {
     const existing = db.get('reservations').value().find(r =>
       isHold(r) && r.expiresAt > now && r.sessionId === sessionId &&
       String(r.tnVariantId || '') === String(channel) && r.productoId === side.productoId && r.varianteId === side.varianteId);
-    if (existing && existing.lastAddAt && now - existing.lastAddAt < DUPLICATE_ADD_MS && toNum(existing.lastAddQty) === side.qty) {
+    if (!meta.noDedupe && existing && existing.lastAddAt && now - existing.lastAddAt < DUPLICATE_ADD_MS && toNum(existing.lastAddQty) === side.qty) {
       return { ok: true, duplicate: true, ids: [existing.id] };
     }
     const heldBySession = activeHolds(r => r.sessionId === sessionId && r.productoId === side.productoId && r.varianteId === side.varianteId)
@@ -566,6 +568,7 @@ function placeHolds(sessionId, sides, channel, meta = {}) {
     let qtyTotal = side.qty;
     if (existing) {
       existing.qty = toNum(existing.qty) + side.qty;
+      existing.units = toNum(existing.units === undefined ? existing.qty - side.qty : existing.units) + toNum(side.units || side.qty);
       existing.expiresAt = now + RESERVATION_MS;
       existing.lastAddAt = now; existing.lastAddQty = side.qty;
       qtyTotal = existing.qty;
@@ -578,7 +581,7 @@ function placeHolds(sessionId, sides, channel, meta = {}) {
         id, kind: 'hold', sessionId,
         productoId: side.productoId, varianteId: side.varianteId,
         tnVariantId: String(channel),
-        qty: side.qty, expiresAt: now + RESERVATION_MS, createdAt: now,
+        qty: side.qty, units: toNum(side.units || side.qty), expiresAt: now + RESERVATION_MS, createdAt: now,
         lastAddAt: now, lastAddQty: side.qty,
         comboGroupId: meta.comboGroupId || null,
         matchId: meta.matchId || null
@@ -658,7 +661,7 @@ async function releaseExpiredReservations() {
   if (expired.length === 0) return 0;
   console.log(`[RESERVAS] Liberando ${expired.length} reserva(s) expirada(s)...`);
   return dropHolds(expired, 'cart_expired',
-    h => `${holdLabel(h)}Sesión ${h.sessionId ? String(h.sessionId).slice(0, 8) : '?'} · Carrito abandonado (30 min)`);
+    h => `${holdLabel(h)}Sesión ${h.sessionId ? String(h.sessionId).slice(0, 8) : '?'} · Carrito abandonado (${HOLD_MINUTES} min)`);
 }
 
 // ─── Migración de datos (corre al arrancar, es idempotente) ─────────────────
@@ -1227,8 +1230,8 @@ app.delete('/api/productos/:id/variantes/:varId/links/:variant_id', (req, res) =
 // Producto normal: retiene la unidad en el diseño elegido (los demás diseños que
 // comparten el stock bajan en TN). Combo: retiene en las dos variantes individuales.
 // Si no hay disponible → 409 y no se reserva nada.
-// Límite simple por IP: 40 pedidos por minuto por defecto (un cliente real hace muy pocos)
-const RESERVE_RATE_PER_MIN = Math.max(1, toNum(process.env.SC_RESERVE_RATE_PER_MIN) || 40);
+// Límite simple por IP: 120 pedidos por minuto por defecto (varios clientes pueden compartir IP en el celular)
+const RESERVE_RATE_PER_MIN = Math.max(1, toNum(process.env.SC_RESERVE_RATE_PER_MIN) || 120);
 const reserveHits = new Map();
 function reserveRateLimited(ip) {
   const now = Date.now();
@@ -1240,6 +1243,110 @@ function reserveRateLimited(ip) {
   return h.n > RESERVE_RATE_PER_MIN;
 }
 const MAX_HELD_PER_SESSION = 10; // unidades por sesión y variante
+
+// Un canal de TN (variante vinculada o variante de contenedor de combo) → stocks de SC que retiene.
+// units = cantidad en unidades del canal (un combo = 1 unidad aunque retenga en 2 variantes).
+function sidesForChannel(channel, units) {
+  const internal = findInternalByTnVariant(channel);
+  if (internal) return { kind: 'direct', sides: [{ ...internal, qty: units, units }] };
+  const matchResult = findMatchByContainerVariant(channel);
+  if (!matchResult) return { kind: null, sides: [] };
+  const { match, vm } = matchResult;
+  const sides = [];
+  for (const tnId of [vm.v1id, vm.v2id]) {
+    const int = findInternalByTnVariant(tnId);
+    if (!int) continue;
+    const same = sides.find(s => s.productoId === int.productoId && s.varianteId === int.varianteId);
+    if (same) same.qty += units; else sides.push({ ...int, qty: units, units });
+  }
+  return { kind: 'combo', sides, match, vm };
+}
+
+// POST /api/reserve/sync — el storefront manda el carrito COMPLETO ({ sessionId, items: [{ variant_id, qty }] })
+// y las reservas de esa sesión pasan a coincidir exactamente: agrega lo nuevo (si hay
+// disponible), achica o libera lo que se sacó y renueva el tiempo de lo que sigue.
+// Es idempotente: no importa si el navegador recarga, repite o pierde un aviso.
+app.post('/api/reserve/sync', (req, res) => {
+  const { sessionId, items } = req.body || {};
+  const ipKey = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || '?';
+  if (reserveRateLimited(ipKey)) return res.status(429).json({ error: 'Demasiados pedidos, probá en un minuto' });
+  if (!sessionId || String(sessionId).length > 100) return res.status(400).json({ error: 'sessionId inválido' });
+  if (!Array.isArray(items) || items.length > 100) return res.status(400).json({ error: 'items tiene que ser una lista' });
+  const sid = String(sessionId);
+  const now = Date.now();
+
+  // Carrito deseado por canal (líneas repetidas del mismo variant_id se suman)
+  const want = new Map();
+  for (const it of items) {
+    const ch = it && it.variant_id !== undefined && it.variant_id !== null ? String(it.variant_id) : '';
+    const q = Number(it && it.qty);
+    if (!ch || !Number.isInteger(q) || q < 0) continue;
+    want.set(ch, Math.min(MAX_HELD_PER_SESSION, (want.get(ch) || 0) + q));
+  }
+
+  // Lo que ya retiene esta sesión, por canal
+  const mine = new Map();
+  for (const h of activeHolds(r => r.sessionId === sid && r.tnVariantId)) {
+    const ch = String(h.tnVariantId);
+    if (!mine.has(ch)) mine.set(ch, []);
+    mine.get(ch).push(h);
+  }
+  const heldUnits = (holds) => Math.max(0, ...holds.map(h => toNum(h.units === undefined ? h.qty : h.units)));
+  const reason = (h, extra) => `${holdLabel(h)}Sesión ${sid.slice(0, 8)} · ${extra}`;
+
+  const released = [];
+  const touched = new Map();
+  for (const [ch, holds] of mine) {
+    const target = want.get(ch) || 0;
+    const held = heldUnits(holds);
+    if (target >= held) {
+      for (const h of holds) h.expiresAt = now + RESERVATION_MS; // sigue en el carrito: renovar
+      continue;
+    }
+    if (target === 0) {
+      dropHolds(holds, 'cart_released', h => reason(h, 'sacado del carrito'));
+      released.push({ variant_id: ch, qty: held });
+      continue;
+    }
+    // Bajó la cantidad: achicar cada lado en proporción
+    for (const h of holds) {
+      const perUnit = toNum(h.qty) / Math.max(1, toNum(h.units === undefined ? h.qty : h.units));
+      h.qty = Math.max(1, Math.round(perUnit * target));
+      h.units = target;
+      h.expiresAt = now + RESERVATION_MS;
+      const v = getVariantRef(h.productoId, h.varianteId).value();
+      if (v) pushLog(h.productoId, h.varianteId, {
+        action: 'cart_released', reservation_id: h.id, session_id: sid, tn_variant_id: ch,
+        delta: 0, stock: toNum(v.stock), reason: reason(h, `bajó a ${target} en el carrito`)
+      });
+      touched.set(`${h.productoId}|${h.varianteId}`, h);
+    }
+    db.write();
+    released.push({ variant_id: ch, qty: held - target });
+  }
+  for (const h of touched.values()) syncVariante(h.productoId, h.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
+
+  const ip = ipKey === '?' ? 'IP desconocida' : ipKey;
+  const added = [];
+  const rejected = [];
+  for (const [ch, target] of want) {
+    const held = mine.has(ch) ? heldUnits(mine.get(ch)) : 0;
+    const extra = target - held;
+    if (extra <= 0) continue;
+    const r0 = sidesForChannel(ch, extra);
+    if (!r0.kind || r0.sides.length === 0) continue; // no gestionada
+    const meta = { ip, noDedupe: true };
+    if (r0.kind === 'combo') Object.assign(meta, { matchId: r0.match.id, matchName: r0.match.nombre, label: r0.vm.label, comboGroupId: `mres_${now}` });
+    const r = placeHolds(sid, r0.sides, ch, meta);
+    if (r.ok) added.push({ variant_id: ch, qty: extra });
+    else rejected.push({ variant_id: ch, wanted: target, held, available: r.available });
+  }
+  if (added.length || released.length || rejected.length) {
+    console.log(`[RESERVAS] Sync sesión ${sid.slice(0, 8)}: +${added.length} -${released.length} rechazadas ${rejected.length}`);
+  }
+  db.write();
+  res.json({ ok: rejected.length === 0, added, released, rejected });
+});
 
 app.post('/api/reserve', (req, res) => {
   const { sessionId, variant_id } = req.body || {};

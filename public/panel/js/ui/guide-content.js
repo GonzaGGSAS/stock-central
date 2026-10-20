@@ -82,7 +82,7 @@ export const GUIDES = {
     ideas: [
       { art: 'disponible', term: 'Disponible (el número grande)', text: 'Lo que alguien puede comprar ahora mismo.' },
       { art: 'fisico', term: 'Físico', text: 'Lo que hay en el depósito. Aparece chiquito, abajo del número grande.' },
-      { art: 'reservado', term: 'En carrito (reservado)', text: 'Está en el carrito de un cliente. Se guarda 30 minutos. Si no paga, vuelve solo. Disponible = Físico − En carrito.' },
+      { art: 'reservado', term: 'En carrito (reservado)', text: 'Está en el carrito de un cliente. Se guarda 15 minutos. Si no paga, vuelve solo. Disponible = Físico − En carrito.' },
       { art: 'compartido', term: 'Una prenda, varios diseños', text: 'Varios diseños pueden salir de la misma prenda. Por ejemplo, las remeras "I CRY A LOT" y "F*CK THE PATRIARCHY" usan la misma remera negra talle 4.' },
       { art: 'ultima', term: 'Si queda 1', text: 'Si queda 1 y alguien la pone en el carrito, los otros diseños se ven sin stock. Así no se vende 2 veces.' },
       { art: 'masmenos', term: '+1 y −1', text: 'Suman o restan una unidad al toque. La tienda se actualiza sola.' },
@@ -150,7 +150,7 @@ export const GUIDES = {
         items: [
           { tone: 'ok', kind: 'num', show: '5', text: '**Disponible**: lo que se puede comprar ahora.' },
           { tone: 'n', kind: 'num', show: '6', text: '**Físico**: lo que hay en el depósito.' },
-          { tone: 'warn', kind: 'num', show: '1', text: '**En carritos**: guardado 30 minutos para un cliente.' },
+          { tone: 'warn', kind: 'num', show: '1', text: '**En carritos**: guardado 15 minutos para un cliente.' },
           { tone: 'warn', kind: 'text', show: 'TN: 3 · difiere', text: 'La tienda muestra otro número. Tocá **Sincronizar con TN**.' },
           { tone: 'bad', kind: 'text', show: 'Ya no existe en Tiendanube', text: 'Ese producto se borró de la tienda. Desvinculalo.' },
         ],
@@ -218,7 +218,7 @@ export const GUIDES = {
     ideas: [
       { art: 'pedido', term: 'Las ventas se descuentan solas', text: 'Cuando entra el pedido, se resta solo. Si pagan por transferencia, se resta igual al entrar el pedido.' },
       { art: 'vuelve', term: 'Si cancelan, vuelve solo', text: 'Cuando se cancela un pedido, el stock vuelve solo. No hace falta sumarlo a mano.' },
-      { art: 'reservado', term: 'Carritos', text: 'Alguien puso algo en el carrito. Se guarda 30 minutos. Si no paga, se libera solo.' },
+      { art: 'reservado', term: 'Carritos', text: 'Alguien puso algo en el carrito. Se guarda 15 minutos. Si no paga, se libera solo.' },
     ],
     si: [
       'Usala para responder "¿por qué cambió este número?".',

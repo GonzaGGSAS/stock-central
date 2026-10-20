@@ -56,13 +56,13 @@ const ART = {
     ${txt(122, 58, '3', 34, 'n')}
     ${txt(122, 80, 'en la caja', 11, 'muted')}`,
 
-  // Reservado: un carrito con un reloj de 30 minutos.
+  // Reservado: un carrito con un reloj de 15 minutos.
   reservado: () => html`
     ${shape(CART, 8, 18, 1.6, 'warn')}
     <circle cx="35" cy="83" r="4" class="gs gs-warn" /><circle cx="67" cy="83" r="4" class="gs gs-warn" />
     ${shape(TEE, 34, 30, 0.72, 'warn', 'warn')}
     ${clock(126, 42, 22)}
-    ${txt(126, 82, '30 min', 12, 'warn')}`,
+    ${txt(126, 82, '15 min', 12, 'warn')}`,
 
   // Stock compartido: dos remeras distintas salen de la misma caja.
   compartido: () => html`
