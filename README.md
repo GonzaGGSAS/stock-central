@@ -1,93 +1,43 @@
-# Stock Central — Gestor de Stock para Tiendanube
+# Stock Central — stock de Minch para Tiendanube
 
-Sincronizá múltiples productos/variantes bajo un mismo SKU central.
-Cuando se paga una orden → el stock se descuenta automáticamente de TODAS las variantes vinculadas.
+SC es la **fuente única de verdad** del stock. Tiendanube (TN) solo muestra lo que SC le empuja.
+Un mismo stock interno puede venderse por varios productos de TN (diseños que salen de la misma
+remera/buzo) y por combos ("Matchs").
 
----
-
-## Estructura
-
-```
-stock-central/
-├── server.js          ← Backend Node.js (API + webhook receiver)
-├── package.json
-├── data/
-│   └── db.json        ← Base de datos local (auto-generado)
-└── frontend/
-    └── App.jsx        ← Frontend React
-```
-
----
-
-## Setup paso a paso
-
-### 1. Instalar dependencias
+## Correr
 
 ```bash
-npm install express cors body-parser lowdb@1.0.0 node-fetch
+npm start          # http://localhost:3001 — panel en / , API en /api
+npm test           # suite completa contra un Tiendanube falso (no toca la tienda)
 ```
 
-### 2. Levantar el servidor
+Variables de entorno:
 
-```bash
-node server.js
-# Corre en http://localhost:3001
-```
+| Variable | Para qué |
+|---|---|
+| `PORT` | puerto (Railway lo pone solo) |
+| `ACCESS_TOKEN`, `STORE_ID` | credenciales de TN (también se cargan desde el panel) |
+| `ADMIN_TOKEN` | si está, el panel y la API piden ese token (el storefront sigue público) |
+| `TN_APP_SECRET` | si está, se rechazan webhooks sin firma HMAC válida de TN |
+| `DB_PATH` | ruta de la base (default `./data/db.json`, tiene que estar en un volumen persistente) |
 
-### 3. Exponer con ngrok (desarrollo local)
+## Cómo funciona el stock
 
-```bash
-ngrok http 3001
-# Te da algo como: https://abc123.ngrok.io
-```
+- **Ventas**: el webhook `order/created` descuenta (no `order/paid`, porque las transferencias tardan).
+  `order/paid` solo registra el pago; `order/cancelled` devuelve, una sola vez y solo si la orden figura
+  cancelada en TN. La idempotencia es por línea de orden (`db.order_items`).
+- **Carritos**: `POST /api/reserve` retiene la unidad en el diseño que eligió el cliente, sin descontar
+  stock físico. A cada producto de TN se le manda `libre + lo reservado en ese producto`, así:
+  - quien tiene el producto en el carrito puede pagar;
+  - si queda 1 sola unidad, los demás diseños que comparten ese stock pasan a 0 y nadie (ni la misma
+    persona) puede llevarse una segunda.
+  Si no hay disponible responde 409. Las reservas vencen a los 30 minutos.
+- **Combos**: el contenedor muestra el mínimo de los dos productos calculado desde SC. Reservar un combo
+  retiene en los dos productos (todo o nada).
+- **Revisión de órdenes** cada 10 min: procesa órdenes que no llegaron por webhook (deploys, caídas).
+- **Ciclo cada 6 h**: revisión de órdenes → SC corrige a TN donde difiera → talles faltantes en combos →
+  stock de combos.
+- **Alertas** en el panel: sobreventa, ventas de productos no vinculados, errores de sync, carritos
+  rechazados, discrepancias con TN.
 
-### 4. Obtener credenciales de Tiendanube
-
-1. Ir a **partners.tiendanube.com**
-2. Crear app con permisos: read_products, write_products, read_orders
-3. Instalarla en tu tienda
-4. Obtenés: access_token + user_id (= store_id)
-
-### 5. Configurar la app
-
-- Abrí el frontend
-- Ingresá Store ID y Access Token
-- Pegá la URL pública para registrar webhooks
-
----
-
-## Deploy en producción
-
-### Railway (recomendado)
-```bash
-npm install -g @railway/cli && railway login && railway init && railway up
-```
-
-### Render
-- Build: `npm install` / Start: `node server.js`
-
----
-
-## Flujo automático
-
-```
-Cliente paga → Tiendanube → webhook order/paid → Stock Central
-  → descuenta stock central
-  → actualiza TODAS las variantes vinculadas vía API
-```
-
-Cancelaciones: el stock se restaura automáticamente.
-
----
-
-## Endpoints principales
-
-| Método | Ruta | Descripción |
-|--------|------|-------------|
-| GET | /api/skus | Listar SKUs |
-| POST | /api/skus | Crear SKU |
-| PUT | /api/skus/:sku/stock | Ajustar stock |
-| DELETE | /api/skus/:sku | Eliminar SKU |
-| POST | /api/skus/:sku/variants | Vincular variante |
-| POST | /api/skus/:sku/sync | Forzar sync manual |
-| POST | /webhook/order | Receptor de webhooks |
+El contrato de la API del panel está en [docs/api-panel.md](docs/api-panel.md).

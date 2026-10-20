@@ -8,393 +8,901 @@ const bodyParser = require('body-parser');
 const low = require('lowdb');
 const FileSync = require('lowdb/adapters/FileSync');
 const fs = require('fs');
+const crypto = require('crypto');
 
-if (!fs.existsSync('./data')) fs.mkdirSync('./data');
+const path = require('path');
 
-const adapter = new FileSync('./data/db.json');
+// DB_PATH y TN_API_BASE se pueden cambiar por env (los tests usan una DB temporal y un TN falso)
+const DB_PATH = process.env.DB_PATH || './data/db.json';
+const TN_API_BASE = (process.env.TN_API_BASE || 'https://api.tiendanube.com/2025-03').replace(/\/$/, '');
+if (!fs.existsSync(path.dirname(DB_PATH))) fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+// Escritura atómica: si el proceso muere a mitad de un write, db.json no queda truncado
+class AtomicFileSync extends FileSync {
+  write(data) {
+    const tmp = `${this.source}.tmp`;
+    fs.writeFileSync(tmp, this.serialize(data));
+    fs.renameSync(tmp, this.source);
+  }
+}
+const adapter = new AtomicFileSync(DB_PATH);
 const db = low(adapter);
 
 db.defaults({
   config: { access_token: '', store_id: '', webhook_registered: false },
   productos: [],
   reservations: [], // { id, sessionId, productoId, varianteId, qty, expiresAt }
-  matchs: []        // { id, nombre, producto1: {tn_product_id, nombre}, producto2: {tn_product_id, nombre} }
+  matchs: [],       // { id, nombre, producto1: {tn_product_id, nombre}, producto2: {tn_product_id, nombre} }
+  alerts: [],       // errores para mostrar en el panel (ver addAlert)
+  order_items: {},  // idempotencia de órdenes: "order|producto|variante|tn_variant" → { state: sold|returned, qty }
+  meta: {}          // marcas de tiempo: último webhook, última reconciliación, piso de la revisión de órdenes
 }).write();
 
 const app = express();
 app.use(cors());
-app.use(bodyParser.json());
+// rawBody se guarda para poder verificar la firma HMAC de los webhooks
+app.use(bodyParser.json({ limit: '2mb', verify: (req, res, buf) => { req.rawBody = buf; } }));
+// Panel web (public/panel) servido en la raíz
+app.use(express.static(path.join(__dirname, 'public', 'panel')));
+
+// Auth opcional del panel: si ADMIN_TOKEN está configurado, /api/* pide
+// "Authorization: Bearer <token>" (o ?token= para el SSE). El storefront
+// (reservas) y /api/health siguen siendo públicos.
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+function safeEqual(a, b) {
+  const ba = Buffer.from(String(a)), bb = Buffer.from(String(b));
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
+}
+app.use((req, res, next) => {
+  // Express rutea sin distinguir mayúsculas: comparar en minúsculas
+  const p = req.path.toLowerCase().replace(/\/+$/, '') || '/';
+  if (!ADMIN_TOKEN || !(p === '/api' || p.startsWith('/api/')) || req.method === 'OPTIONS') return next();
+  if (p === '/api/health') return next();
+  if ((p === '/api/reserve' || p === '/api/reservations') && req.method === 'POST') return next();
+  if ((p.startsWith('/api/reserve/') || p.startsWith('/api/reservations/')) && req.method === 'DELETE') return next();
+  const h = String(req.headers.authorization || '');
+  const token = h.startsWith('Bearer ') ? h.slice(7) : String(req.query.token || '');
+  if (token && safeEqual(token, ADMIN_TOKEN)) return next();
+  res.status(401).json({ error: 'No autorizado', code: 'unauthorized' });
+});
 const PORT = process.env.PORT || 3001;
 const RESERVATION_MS = 30 * 60 * 1000; // 30 minutos
 
 // ─── Helper: API Tiendanube ──────────────────────────────────────────────────
+// Rate limit de TN: leaky bucket de 40 requests que se vacía a 2 por segundo.
+// Todas las llamadas pasan por este bucket (capacidad 30, margen de seguridad) y
+// los 429 se reintentan con backoff, así las cascadas de syncs no revientan.
+const TN_THROTTLE = process.env.TN_THROTTLE !== 'off';
+const tnBucket = { tokens: 30, capacity: 30, perSec: 2, last: Date.now() };
+async function tnTakeToken() {
+  if (!TN_THROTTLE) return;
+  for (;;) {
+    const now = Date.now();
+    tnBucket.tokens = Math.min(tnBucket.capacity, tnBucket.tokens + ((now - tnBucket.last) / 1000) * tnBucket.perSec);
+    tnBucket.last = now;
+    if (tnBucket.tokens >= 1) { tnBucket.tokens -= 1; return; }
+    await sleep(Math.ceil(((1 - tnBucket.tokens) / tnBucket.perSec) * 1000));
+  }
+}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 async function tnRequest(method, path, body = null) {
   const { access_token, store_id } = db.get('config').value();
   if (!access_token || !store_id) throw new Error('No configurado');
   const fetch = (await import('node-fetch')).default;
-  const res = await fetch(`https://api.tiendanube.com/2025-03/${store_id}${path}`, {
-    method,
-    headers: { 'Authentication': `bearer ${access_token}`, 'Content-Type': 'application/json', 'User-Agent': 'StockCentral (soporte@minch.com.ar)' },
-    body: body ? JSON.stringify(body) : null
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.description || `API error ${res.status}`);
-  return data;
-}
-
-// ─── Helper: Sync variante a Tiendanube ─────────────────────────────────────
-async function syncVariante(productoId, varianteId, onProgress) {
-  const prod = db.get('productos').find({ id: productoId }).value();
-  if (!prod) throw new Error('Producto no encontrado');
-  const variante = prod.variantes.find(v => v.id === varianteId);
-  if (!variante) throw new Error('Variante no encontrada');
-  const errors = [];
-  let updated = 0;
-  for (let i = 0; i < variante.links.length; i++) {
-    const link = variante.links[i];
-    let success = false;
-    // Intentar hasta 2 veces
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        await tnRequest('PUT', `/products/${link.product_id}/variants/${link.variant_id}`, { stock: variante.stock });
-        success = true;
-        break;
-      } catch (e) {
-        if (attempt === 1) {
-          errors.push({ variant_id: link.variant_id, label: link.label, error: e.message });
-        } else {
-          await new Promise(r => setTimeout(r, 500)); // esperar antes del retry
-        }
-      }
-    }
-    if (success) updated++;
-    // Notificar progreso si hay listener
-    if (onProgress) onProgress({ current: i + 1, total: variante.links.length, label: link.label, ok: success });
-    // Pausa entre requests para evitar rate limit
-    if (i < variante.links.length - 1) await new Promise(r => setTimeout(r, 150));
-  }
-  db.get('productos').find({ id: productoId }).get('variantes').find({ id: varianteId }).get('log').unshift({
-    ts: new Date().toISOString(), action: 'sync', stock: variante.stock,
-    links_updated: updated, errors: errors.length > 0 ? errors : undefined
-  }).write();
-
-  // ─── Re-sincronizar Matchs (combos) que contienen esta variante ─────────
-  // Cuando cambia el stock de un producto individual, los combos que lo incluyen
-  // también deben actualizar el stock de su contenedor en TN
-  try {
-    const affectedMatchs = await resyncMatchsForVariant(variante.links);
-    if (affectedMatchs.length > 0) {
-      console.log(`[SYNC] Matchs re-sincronizados: ${affectedMatchs.join(', ')}`);
-    }
-  } catch (e) {
-    console.error('[SYNC] Error re-sincronizando matchs:', e.message);
-  }
-
-  return { ok: true, updated, total: variante.links.length, errors };
-}
-
-// ─── Helper: re-sincronizar todos los Matchs afectados por links ─────────────
-// Recibe un array de links (cada uno con variant_id) y actualiza el contenedor
-// en TN de cada Match que contenga alguna de esas variantes individuales
-async function resyncMatchsForVariant(links) {
-  if (!Array.isArray(links) || links.length === 0) return [];
-  const variantIds = new Set(links.map(l => String(l.variant_id)));
-  const matchs = db.get('matchs').value();
-  const affected = new Set(); // ids de matchs ya re-sincronizados (deduplicación)
-
-  for (const match of matchs) {
-    if (!match.variantMap || !match.tn_match_product_id) continue;
-    // Un match se ve afectado si alguno de sus v1id o v2id está en las variantes que cambiaron
-    const isAffected = match.variantMap.some(vm =>
-      variantIds.has(String(vm.v1id)) || variantIds.has(String(vm.v2id))
-    );
-    if (!isAffected || affected.has(match.id)) continue;
-    affected.add(match.id);
-
-    // Llamar la lógica de sync-stock para este match
+  const MAX_RETRIES = 4;
+  for (let attempt = 0; ; attempt++) {
+    await tnTakeToken();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 25000);
+    let res;
     try {
-      const [p1data, p2data] = await Promise.all([
-        tnRequest('GET', `/products/${match.producto1.tn_product_id}?fields=id,variants`),
-        tnRequest('GET', `/products/${match.producto2.tn_product_id}?fields=id,variants`)
-      ]);
-      const p1varMap = Object.fromEntries(p1data.variants.map(v => [String(v.id), toNum(v.stock)]));
-      const p2varMap = Object.fromEntries(p2data.variants.map(v => [String(v.id), toNum(v.stock)]));
-
-      for (const vm of match.variantMap) {
-        const s1 = p1varMap[vm.v1id];
-        const s2 = p2varMap[vm.v2id];
-        if (s1 === undefined || s2 === undefined) continue;
-        const newStock = Math.min(s1, s2);
-        await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
-        await new Promise(r => setTimeout(r, 150)); // rate limit
-      }
-      console.log(`[SYNC] Match "${match.nombre}" contenedor actualizado`);
+      res = await fetch(`${TN_API_BASE}/${store_id}${path}`, {
+        method,
+        headers: { 'Authentication': `bearer ${access_token}`, 'Content-Type': 'application/json', 'User-Agent': 'StockCentral (soporte@minch.com.ar)' },
+        body: body ? JSON.stringify(body) : null,
+        signal: controller.signal
+      });
     } catch (e) {
-      console.error(`[SYNC] Error en match "${match.nombre}":`, e.message);
+      clearTimeout(timer);
+      if (attempt < MAX_RETRIES && method !== 'POST') { await sleep(1000 * 2 ** attempt); continue; }
+      throw new Error(e.name === 'AbortError' ? 'Tiendanube no respondió (timeout)' : `No se pudo conectar con Tiendanube: ${e.message}`);
     }
+    clearTimeout(timer);
+    const text = await res.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { description: text.slice(0, 200) }; }
+    if (res.status === 429 && attempt < MAX_RETRIES) {
+      // x-rate-limit-reset viene en ms hasta que el bucket se vacía
+      const reset = toNum(res.headers.get('x-rate-limit-reset'));
+      const wait = Math.min(10000, Math.max(reset, 1000 * 2 ** attempt));
+      tnBucket.tokens = 0;
+      console.warn(`[TN] 429 en ${method} ${path} — reintento ${attempt + 1} en ${wait}ms`);
+      await sleep(wait);
+      continue;
+    }
+    if (!res.ok) {
+      const err = new Error(data.description || data.message || `API error ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
   }
-  return Array.from(affected);
 }
 
 // ─── Helper: forzar número (corrige stocks guardados como string) ───────────
 // Bug histórico: si variante.stock quedó como string, "4" + 1 = "41" (concat)
 function toNum(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 
-// ─── Helper: chequear si una orden ya descontó stock de una variante ────────
-// Evita doble descuento entre order/created y order/paid (idempotencia).
-// La key es (order_id + tn_variant_id): si una orden tiene 2 line items distintos
-// de TN que caen en la misma variante interna (mismo SKU compartido), ambos
-// deben descontarse; pero el retry del MISMO line item no debe repetir.
-function orderAlreadyDiscounted(productoId, varianteId, order_id, tn_variant_id) {
-  const v = db.get('productos').find({ id: productoId }).get('variantes').find({ id: varianteId }).value();
-  if (!v) return false;
-  return (v.log || []).some(e =>
-    e.order_id === String(order_id) &&
-    e.action === 'sale' &&
-    (tn_variant_id == null || String(e.tn_variant_id || '') === String(tn_variant_id))
-  );
+// ════════════════════════════════════════════════════════════════════════════
+// Eventos en vivo (SSE) — el panel se actualiza solo, sin refrescar
+// ════════════════════════════════════════════════════════════════════════════
+const sseClients = new Set();
+const pendingTopics = new Map();
+let emitTimer = null;
+function emitChange(topic, data = {}) {
+  pendingTopics.set(topic + JSON.stringify(data), { topic, ...data });
+  if (emitTimer) return;
+  emitTimer = setTimeout(() => {
+    emitTimer = null;
+    const items = [...pendingTopics.values()];
+    pendingTopics.clear();
+    for (const item of items) {
+      const payload = `event: change\ndata: ${JSON.stringify(item)}\n\n`;
+      for (const c of sseClients) { try { c.write(payload); } catch (_) { /* cliente caído */ } }
+    }
+  }, 250);
 }
 
-// ─── Helper: stock disponible (descontando reservas activas) ─────────────────
-function getAvailableStock(productoId, varianteId) {
-  const prod = db.get('productos').find({ id: productoId }).value();
-  if (!prod) return 0;
-  const variante = prod.variantes.find(v => v.id === varianteId);
-  if (!variante) return 0;
-  const now = Date.now();
-  const reservado = db.get('reservations')
-    .filter(r => r.productoId === productoId && r.varianteId === varianteId && r.expiresAt > now)
-    .reduce((acc, r) => acc + toNum(r.qty), 0)
-    .value();
-  return Math.max(0, toNum(variante.stock) - reservado);
+// ════════════════════════════════════════════════════════════════════════════
+// Alertas — los errores que el dueño tiene que ver en el panel
+// ════════════════════════════════════════════════════════════════════════════
+const ALERTS_MAX = 300;
+function addAlert({ key, type, severity = 'warning', title, detail = '', reopen = false, once = false, ...rest }) {
+  const now = new Date().toISOString();
+  const list = db.get('alerts').value();
+  const existing = key ? list.find(a => a.key === key) : null;
+  if (existing && once) return existing; // mismo evento (misma orden): no se cuenta dos veces
+  if (existing) {
+    existing.count = (existing.count || 1) + (reopen || !existing.dismissed ? 1 : 0);
+    existing.detail = detail || existing.detail;
+    existing.title = title || existing.title;
+    if (reopen) { existing.ts = now; existing.dismissed = false; existing.resolved = false; }
+    db.write();
+    emitChange('alerts');
+    return existing;
+  }
+  const alert = {
+    id: `al_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+    key: key || null, ts: now, type, severity, title, detail, count: 1, dismissed: false, ...rest
+  };
+  list.unshift(alert);
+  if (list.length > ALERTS_MAX) {
+    // primero se van las descartadas más viejas
+    for (let i = list.length - 1; i >= 0 && list.length > ALERTS_MAX; i--) if (list[i].dismissed) list.splice(i, 1);
+    if (list.length > ALERTS_MAX) list.length = ALERTS_MAX;
+  }
+  db.write();
+  emitChange('alerts');
+  console.warn(`[ALERTA] ${type}: ${title}${detail ? ' — ' + detail : ''}`);
+  return alert;
+}
+// Marca como resueltas las alertas abiertas con esa key (ej: el sync volvió a funcionar)
+function resolveAlert(key) {
+  const a = db.get('alerts').value().find(x => x.key === key && !x.dismissed);
+  if (!a) return;
+  a.dismissed = true; a.resolved = true; a.resolved_at = new Date().toISOString();
+  db.write();
+  emitChange('alerts');
+}
+
+function setMeta(k, v) { db.set(`meta.${k}`, v).write(); }
+
+// ════════════════════════════════════════════════════════════════════════════
+// Búsquedas y log
+// ════════════════════════════════════════════════════════════════════════════
+const LOG_MAX = 400; // movimientos guardados por variante (la idempotencia vive en order_items)
+
+function getVariantRef(productoId, varianteId) {
+  return db.get('productos').find({ id: productoId }).get('variantes').find({ id: varianteId });
+}
+
+// Variante interna de SC que tiene vinculada esta variante de TN (link directo)
+function findInternalByTnVariant(tn_variant_id) {
+  const id = String(tn_variant_id);
+  for (const p of db.get('productos').value()) {
+    for (const v of p.variantes || []) {
+      const link = (v.links || []).find(l => String(l.variant_id) === id);
+      if (link) return { productoId: p.id, varianteId: v.id, prod: p, variante: v, link };
+    }
+  }
+  return null;
 }
 
 // ─── Helper: buscar match por tn_variant_id del contenedor ─────────────────
 function findMatchByContainerVariant(tn_variant_id) {
-  const matchs = db.get('matchs').value();
-  for (const m of matchs) {
+  const id = String(tn_variant_id);
+  for (const m of db.get('matchs').value()) {
     if (!m.variantMap) continue;
-    const vm = m.variantMap.find(v => v.tn_variant_id === String(tn_variant_id));
+    const vm = m.variantMap.find(v => String(v.tn_variant_id) === id);
     if (vm) return { match: m, vm };
   }
   return null;
 }
 
-// ─── Helper: reservar variante individual de producto ────────────────────────
-async function reservarVarianteIndividual(sessionId, tn_variant_id, qty, matchReservationId) {
-  const productos = db.get('productos').value();
-  let foundProd = null, foundVar = null;
-  for (const p of productos) {
-    for (const v of p.variantes) {
-      if (v.links.some(l => l.variant_id === String(tn_variant_id))) { foundProd = p; foundVar = v; break; }
-    }
-    if (foundProd) break;
-  }
-  if (!foundProd || !foundVar) {
-    console.log(`[MATCH-RESERVA] Variante individual ${tn_variant_id} no en Stock Central, descontando directo en TN`);
-    // Descontar directamente en TN si no está en Stock Central
-    try {
-      const variant = await tnRequest('GET', `/products/${foundProd?.id || 0}/variants/${tn_variant_id}`).catch(() => null);
-      if (variant) {
-        const newStock = Math.max(0, (variant.stock || 0) - qty);
-        await tnRequest('PUT', `/products/${variant.product_id}/variants/${tn_variant_id}`, { stock: newStock });
-      }
-    } catch(e) { console.warn('[MATCH-RESERVA] Error desconto TN directo:', e.message); }
-    return null;
-  }
+// Lo que se recorta del log se agrega a un archivo aparte (una línea JSON por movimiento)
+const LOG_ARCHIVE = path.join(path.dirname(DB_PATH), 'log-archive.jsonl');
+function archiveLog(productoId, varianteId, entries) {
+  if (!entries.length) return;
+  try {
+    fs.appendFileSync(LOG_ARCHIVE, entries.map(e => JSON.stringify({ productoId, varianteId, ...e })).join('\n') + '\n');
+  } catch (e) { console.error('[LOG] No se pudo archivar:', e.message); }
+}
 
+// Agrega un movimiento al log de la variante (y opcionalmente cambia campos, ej: stock)
+function pushLog(productoId, varianteId, entry, patch) {
+  const v = getVariantRef(productoId, varianteId).value();
+  if (!v) return null;
+  if (patch) Object.assign(v, patch);
+  if (!Array.isArray(v.log)) v.log = [];
+  v.log.unshift({ ts: new Date().toISOString(), ...entry });
+  if (v.log.length > LOG_MAX) archiveLog(productoId, varianteId, v.log.splice(LOG_MAX));
+  db.write();
+  emitChange('activity', { productoId });
+  if (patch && 'stock' in patch) emitChange('stock', { productoId });
+  return v;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Núcleo de stock: asignación por canal
+// ════════════════════════════════════════════════════════════════════════════
+//
+// Una variante de SC se vende por varios "canales" de TN:
+//   - cada link directo (SKU compartido: varios diseños salen de la misma remera)
+//   - cada combo (variante del contenedor de un Match que la incluye)
+// TN controla stock por variante: si todos los canales muestran el stock completo,
+// un carrito con dos diseños distintos pasa aunque quede 1 sola unidad (bug real:
+// remera negra talle 4 con 1 en stock vendió 2).
+//
+// Regla: las reservas de carrito ("holds") NO descuentan stock físico (así el que
+// tiene el producto en el carrito puede pagar), pero se asignan a su canal.
+// A cada canal se le empuja a TN:
+//        libre + reservado_en_ese_canal        (libre = stock − total reservado)
+// El diseño que está en el carrito conserva su unidad y los demás quedan en 0.
+// La suma de lo que muestra TN nunca supera el stock real.
+
+// Reserva vigente que retiene stock. Las normales viejas (sin kind) también cuentan;
+// las de combo viejas se convierten en migrateDb.
+function isHold(r) { return r.kind === 'hold' || (!r.kind && !r.matchReservationId); }
+
+function activeHolds(filterFn) {
   const now = Date.now();
-  const available = getAvailableStock(foundProd.id, foundVar.id);
-  if (available < qty) {
-    console.warn(`[MATCH-RESERVA] Stock insuficiente para ${foundProd.nombre}/${foundVar.label}: disponible ${available}`);
-    return null;
+  return db.get('reservations').value().filter(r => isHold(r) && r.expiresAt > now && (!filterFn || filterFn(r)));
+}
+
+// Con más de EXACT_BELOW unidades libres no hay riesgo real de sobreventa entre diseños:
+// todos los canales muestran el stock completo y un carrito no genera PUTs a TN.
+// Cuando lo libre baja a EXACT_BELOW o menos, cada canal recibe exactamente lo suyo.
+const EXACT_BELOW = Math.max(0, toNum(process.env.SC_EXACT_BELOW || 3));
+
+function allocation(productoId, varianteId) {
+  const v = getVariantRef(productoId, varianteId).value();
+  const stock = Math.max(0, toNum(v && v.stock));
+  let reserved = 0;
+  const byChannel = new Map();
+  let left = stock; // si hay más reservado que stock, el stock se reparte por orden de llegada
+  const holds = activeHolds(r => r.productoId === productoId && r.varianteId === varianteId)
+    .sort((a, b) => toNum(a.createdAt) - toNum(b.createdAt));
+  for (const h of holds) {
+    const q = toNum(h.qty);
+    reserved += q;
+    const got = Math.min(q, left);
+    left -= got;
+    const ch = h.tnVariantId ? String(h.tnVariantId) : '';
+    byChannel.set(ch, (byChannel.get(ch) || 0) + got);
+  }
+  const free = Math.max(0, stock - reserved);
+  return { stock, reserved, free, byChannel };
+}
+
+function channelStock(alloc, channel) {
+  if (alloc.free > EXACT_BELOW) return alloc.stock;
+  return Math.max(0, Math.min(alloc.stock, alloc.free + (alloc.byChannel.get(String(channel)) || 0)));
+}
+
+// Stock disponible para un carrito nuevo (lo que puede comprar otra persona)
+function getAvailableStock(productoId, varianteId) {
+  return allocation(productoId, varianteId).free;
+}
+
+// Combos (match + variante del contenedor) que usan alguna de estas variantes de TN
+function combosForTnVariants(variantIds) {
+  const out = [];
+  for (const match of db.get('matchs').value()) {
+    if (!match.variantMap || !match.tn_match_product_id) continue;
+    for (const vm of match.variantMap) {
+      if (!vm.tn_variant_id) continue;
+      if (variantIds.has(String(vm.v1id)) || variantIds.has(String(vm.v2id))) out.push({ match, vm });
+    }
+  }
+  return out;
+}
+
+// Stock de TN de una variante (para lados de combos que no están gestionados en SC)
+async function tnVariantStock(productId, variantId, ctx) {
+  if (!ctx.products) ctx.products = new Map();
+  const pid = String(productId);
+  if (!ctx.products.has(pid)) {
+    const data = await tnRequest('GET', `/products/${pid}?fields=id,variants`);
+    ctx.products.set(pid, new Map((data.variants || []).map(v => [String(v.id), v.stock === null || v.stock === undefined ? null : toNum(v.stock)])));
+  }
+  return ctx.products.get(pid).get(String(variantId));
+}
+
+// Stock que tiene que mostrar el contenedor de un combo: min de los dos lados,
+// cada lado calculado desde SC con la reserva del propio combo.
+// Devuelve número, null (sin control de stock) o undefined (no se puede calcular).
+async function computeComboStock(match, vm, ctx = {}) {
+  const sides = [[vm.v1id, match.producto1 && match.producto1.tn_product_id], [vm.v2id, match.producto2 && match.producto2.tn_product_id]];
+  const ints = sides.map(([id]) => findInternalByTnVariant(id));
+  if (ints[0] && ints[1] && ints[0].productoId === ints[1].productoId && ints[0].varianteId === ints[1].varianteId) {
+    // los dos lados salen del mismo stock: cada combo consume 2
+    return Math.floor(channelStock(allocation(ints[0].productoId, ints[0].varianteId), vm.tn_variant_id) / 2);
+  }
+  const vals = [];
+  for (let i = 0; i < 2; i++) {
+    if (ints[i]) { vals.push(channelStock(allocation(ints[i].productoId, ints[i].varianteId), vm.tn_variant_id)); continue; }
+    if (!sides[i][1]) return undefined;
+    const s = await tnVariantStock(sides[i][1], sides[i][0], ctx);
+    if (s === undefined) return 0; // la variante individual ya no existe en TN: el combo no se puede vender
+    if (s !== null) vals.push(s);
+  }
+  return vals.length ? Math.min(...vals) : null;
+}
+
+// Versión sin llamadas a TN (para el panel): lados no gestionados usan el último valor conocido
+function comboStockLocal(match, vm) {
+  const ints = [findInternalByTnVariant(vm.v1id), findInternalByTnVariant(vm.v2id)];
+  if (!ints[0] || !ints[1]) return vm.tn_stock === undefined ? null : vm.tn_stock;
+  if (ints[0].productoId === ints[1].productoId && ints[0].varianteId === ints[1].varianteId) {
+    return Math.floor(channelStock(allocation(ints[0].productoId, ints[0].varianteId), vm.tn_variant_id) / 2);
+  }
+  return Math.min(...ints.map(x => channelStock(allocation(x.productoId, x.varianteId), vm.tn_variant_id)));
+}
+
+// ─── Sync a Tiendanube (cola global, una variante a la vez) ─────────────────
+// Serializar evita que dos syncs de la misma variante se pisen con valores viejos;
+// si llega otro pedido mientras corre, se agrupa y corre una vez más al final.
+const syncQueue = new Map();
+let syncRunning = false;
+
+function syncVariante(productoId, varianteId, onProgress, opts = {}) {
+  const key = `${productoId}|${varianteId}`;
+  return new Promise((resolve, reject) => {
+    let entry = syncQueue.get(key);
+    if (!entry) {
+      entry = { productoId, varianteId, forceAll: false, force: new Set(), progress: [], waiters: [] };
+      syncQueue.set(key, entry);
+    }
+    if (opts.force === true) entry.forceAll = true;
+    else if (opts.force) for (const f of opts.force) entry.force.add(String(f));
+    if (onProgress) entry.progress.push(onProgress);
+    entry.waiters.push({ resolve, reject });
+    drainSyncQueue();
+  });
+}
+
+async function drainSyncQueue() {
+  if (syncRunning) return;
+  syncRunning = true;
+  try {
+    while (syncQueue.size > 0) {
+      const [key, entry] = syncQueue.entries().next().value;
+      syncQueue.delete(key);
+      try {
+        const r = await doSyncVariante(entry);
+        entry.waiters.forEach(w => w.resolve(r));
+      } catch (e) {
+        entry.waiters.forEach(w => w.reject(e));
+      }
+    }
+  } finally {
+    syncRunning = false;
+  }
+}
+
+async function doSyncVariante({ productoId, varianteId, forceAll, force, progress }) {
+  const prod = db.get('productos').find({ id: productoId }).value();
+  if (!prod) throw new Error('Producto no encontrado');
+  const variante = (prod.variantes || []).find(v => v.id === varianteId);
+  if (!variante) throw new Error('Variante no encontrada');
+  const links = variante.links || [];
+  const combos = combosForTnVariants(new Set(links.map(l => String(l.variant_id))));
+  const total = links.length + combos.length;
+  const notify = (p) => progress.forEach(fn => { try { fn(p); } catch (_) { /* listener roto */ } });
+  // Solo se hace PUT si cambió respecto de lo último empujado (o si se fuerza / hubo error)
+  const mustPush = (id, cached, value, hadError) => forceAll || force.has(String(id)) || cached !== value || hadError;
+  const errors = [];
+  let updated = 0, current = 0, combosUpdated = 0;
+  const now = () => new Date().toISOString();
+
+  for (const link of links) {
+    const value = channelStock(allocation(productoId, varianteId), link.variant_id);
+    let ok = true;
+    if (link.missing_in_tn && !forceAll && !force.has(String(link.variant_id))) { notify({ current: ++current, total, label: link.label, ok: false }); continue; }
+    if (mustPush(link.variant_id, link.tn_stock, value, !!link.sync_error)) {
+      try {
+        await tnRequest('PUT', `/products/${link.product_id}/variants/${link.variant_id}`, { stock: value });
+        link.tn_stock = value; link.tn_synced_at = now(); delete link.sync_error; delete link.missing_in_tn;
+        updated++;
+      } catch (e) {
+        ok = false;
+        link.sync_error = e.message;
+        if (e.status === 404) link.missing_in_tn = true;
+        errors.push({ variant_id: link.variant_id, label: link.label, error: e.status === 404 ? 'Esa variante ya no existe en Tiendanube (desvinculala o volvé a importarla)' : e.message });
+      }
+    }
+    notify({ current: ++current, total, label: link.label, ok });
   }
 
-  const reservationId = `res_match_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-  const newStock = toNum(foundVar.stock) - toNum(qty);
+  const ctx = {};
+  for (const { match, vm } of combos) {
+    let ok = true;
+    try {
+      const value = await computeComboStock(match, vm, ctx);
+      if (value !== undefined && mustPush(vm.tn_variant_id, vm.tn_stock, value, !!vm.sync_error)) {
+        await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: value });
+        vm.tn_stock = value; delete vm.sync_error;
+        combosUpdated++;
+      }
+    } catch (e) {
+      ok = false;
+      vm.sync_error = e.message;
+      errors.push({ variant_id: vm.tn_variant_id, label: `${match.nombre} · ${vm.label}`, error: e.message });
+    }
+    notify({ current: ++current, total, label: `${match.nombre} · ${vm.label}`, ok });
+  }
+  db.write();
 
-  db.get('reservations').push({
-    id: reservationId, sessionId,
-    productoId: foundProd.id, varianteId: foundVar.id,
-    tnVariantId: String(tn_variant_id),
-    qty: toNum(qty), expiresAt: now + RESERVATION_MS,
-    matchReservationId: matchReservationId || null // para agrupar reservas del mismo match
-  }).write();
+  if (updated > 0 || combosUpdated > 0 || errors.length > 0) {
+    pushLog(productoId, varianteId, {
+      action: 'sync', stock: toNum(variante.stock),
+      links_updated: updated, combos_updated: combosUpdated || undefined,
+      errors: errors.length > 0 ? errors : undefined
+    });
+  }
+  const alertKey = `sync_error|${productoId}|${varianteId}`;
+  if (errors.length > 0) {
+    addAlert({
+      key: alertKey, type: 'sync_error', severity: 'error', reopen: true,
+      title: `No se pudo actualizar Tiendanube: ${prod.nombre} · ${variante.label}`,
+      detail: errors.slice(0, 3).map(e => `${e.label}: ${e.error}`).join(' | ') + (errors.length > 3 ? ` (+${errors.length - 3})` : ''),
+      productoId, varianteId
+    });
+  } else {
+    resolveAlert(alertKey);
+  }
+  emitChange('stock', { productoId });
+  return { ok: errors.length === 0, updated, combos_updated: combosUpdated, total, errors };
+}
 
-  db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
-    .assign({ stock: newStock }).get('log').unshift({
-      ts: new Date().toISOString(), action: 'reserved',
-      reservation_id: reservationId, session_id: sessionId,
-      delta: -parseInt(qty), stock: newStock,
-      reason: 'Reserva de carrito Match (30 min)'
-    }).write();
+// ─── Helper: chequear si una orden ya descontó stock de una variante ────────
+// Idempotencia por (order_id + variante interna + tn_variant_id): si una orden
+// tiene 2 line items de TN distintos que caen en la misma variante interna (SKU
+// compartido), ambos descuentan; el retry del MISMO line item no repite.
+// El estado vive en db.order_items (no en el log, que se recorta).
+function itemKey(order_id, productoId, varianteId, tn_variant_id) {
+  return `${order_id}|${productoId}|${varianteId}|${tn_variant_id || ''}`;
+}
+function getItemRecord(order_id, productoId, varianteId, tn_variant_id) {
+  const items = db.get('order_items').value();
+  return items[itemKey(order_id, productoId, varianteId, tn_variant_id)]
+    // ventas viejas (antes del fix de SKU compartido) se guardaron sin tn_variant_id
+    || items[itemKey(order_id, productoId, varianteId, '')]
+    || null;
+}
+function setItemRecord(order_id, productoId, varianteId, tn_variant_id, patch) {
+  const items = db.get('order_items').value();
+  const key = itemKey(order_id, productoId, varianteId, tn_variant_id);
+  items[key] = { ...(items[key] || {}), ...patch, ts: new Date().toISOString() };
+  db.write();
+}
+function orderAlreadyDiscounted(productoId, varianteId, order_id, tn_variant_id) {
+  const r = getItemRecord(String(order_id), productoId, varianteId, tn_variant_id);
+  return !!r && (r.state === 'sold' || r.state === 'returned');
+}
 
-  syncVariante(foundProd.id, foundVar.id).catch(e => console.error('[MATCH-RESERVA] Sync error:', e.message));
-  console.log(`[MATCH-RESERVA] ${foundProd.nombre}/${foundVar.label}: stock ${foundVar.stock} → ${newStock}`);
-  return reservationId;
+// ─── Reservas (holds) ────────────────────────────────────────────────────────
+const rejectForcedAt = new Map();
+const DUPLICATE_ADD_MS = 3000; // el storefront tiene varios hooks: el mismo "agregar" puede llegar repetido
+
+// Intenta reservar `qty` en cada lado (1 lado = producto normal, 2 = combo) para el canal dado.
+// Todo o nada: si un lado no tiene disponible, no se reserva ninguno.
+function placeHolds(sessionId, sides, channel, meta = {}) {
+  const now = Date.now();
+  const sessionShort = String(sessionId).slice(0, 8);
+  const failing = [];
+  const plan = [];
+  for (const side of sides) {
+    const alloc = allocation(side.productoId, side.varianteId);
+    const existing = db.get('reservations').value().find(r =>
+      isHold(r) && r.expiresAt > now && r.sessionId === sessionId &&
+      String(r.tnVariantId || '') === String(channel) && r.productoId === side.productoId && r.varianteId === side.varianteId);
+    if (existing && existing.lastAddAt && now - existing.lastAddAt < DUPLICATE_ADD_MS && toNum(existing.lastAddQty) === side.qty) {
+      return { ok: true, duplicate: true, ids: [existing.id] };
+    }
+    const heldBySession = activeHolds(r => r.sessionId === sessionId && r.productoId === side.productoId && r.varianteId === side.varianteId)
+      .reduce((a, r) => a + toNum(r.qty), 0);
+    if (alloc.free < side.qty || heldBySession + side.qty > MAX_HELD_PER_SESSION) failing.push({ side, available: Math.min(alloc.free, Math.max(0, MAX_HELD_PER_SESSION - heldBySession)) });
+    plan.push({ side, existing });
+  }
+
+  if (failing.length > 0) {
+    for (const { side, available } of failing) {
+      const reason = `Sesión ${sessionShort} · ${meta.ip || '?'} · quiso ${side.qty}${meta.label ? ` (${meta.label})` : ''}, disponible ${available}`;
+      pushLog(side.productoId, side.varianteId, {
+        action: 'cart_rejected', session_id: sessionId, tn_variant_id: String(channel),
+        delta: 0, stock: toNum(side.variante.stock), reason
+      });
+      addAlert({
+        key: `cart_rejected|${side.productoId}|${side.varianteId}`, type: 'cart_rejected', severity: 'warning', reopen: true,
+        title: `Carrito rechazado por falta de stock: ${side.prod.nombre} · ${side.variante.label}`,
+        detail: `Alguien quiso agregar ${side.qty}${meta.label ? ` (${meta.label})` : ''} y quedaban ${available} libres. Tiendanube se corrigió para que no se pueda.`,
+        productoId: side.productoId, varianteId: side.varianteId, variant_id: String(channel)
+      });
+      // Si TN dejó agregarlo es porque tenía un número viejo: forzar el canal (como mucho 1 vez por minuto)
+      const fk = `${side.productoId}|${side.varianteId}|${channel}`;
+      const forceNow = !rejectForcedAt.has(fk) || Date.now() - rejectForcedAt.get(fk) > 60000;
+      if (forceNow) rejectForcedAt.set(fk, Date.now());
+      syncVariante(side.productoId, side.varianteId, null, forceNow ? { force: [channel] } : {}).catch(e => console.error('[RESERVAS] Sync error:', e.message));
+    }
+    return { ok: false, available: Math.min(...failing.map(f => f.available)) };
+  }
+
+  const ids = [];
+  let accumulated = false;
+  for (const { side, existing } of plan) {
+    let id;
+    let qtyTotal = side.qty;
+    if (existing) {
+      existing.qty = toNum(existing.qty) + side.qty;
+      existing.expiresAt = now + RESERVATION_MS;
+      existing.lastAddAt = now; existing.lastAddQty = side.qty;
+      qtyTotal = existing.qty;
+      id = existing.id;
+      accumulated = true;
+      db.write();
+    } else {
+      id = `res_${meta.matchId ? 'match_' : ''}${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+      db.get('reservations').push({
+        id, kind: 'hold', sessionId,
+        productoId: side.productoId, varianteId: side.varianteId,
+        tnVariantId: String(channel),
+        qty: side.qty, expiresAt: now + RESERVATION_MS, createdAt: now,
+        lastAddAt: now, lastAddQty: side.qty,
+        comboGroupId: meta.comboGroupId || null,
+        matchId: meta.matchId || null
+      }).write();
+    }
+    ids.push(id);
+    const prefix = meta.matchName ? `[COMBO ${meta.matchName}] ` : '';
+    pushLog(side.productoId, side.varianteId, {
+      action: 'cart_added', reservation_id: id, session_id: sessionId, tn_variant_id: String(channel),
+      delta: 0, stock: toNum(side.variante.stock),
+      reason: `${prefix}Sesión ${sessionShort} · ${meta.ip || '?'} · ${existing ? `+${side.qty} (carrito, qty ${qtyTotal})` : `carrito (qty ${side.qty})`}`
+    });
+    // Re-asignar canales en TN (el resto de los diseños baja si se acabó lo libre)
+    syncVariante(side.productoId, side.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
+  }
+  emitChange('stock', {});
+  return { ok: true, ids, accumulated };
+}
+
+// Saca reservas y re-sincroniza las variantes afectadas
+function dropHolds(holds, action, reasonFn) {
+  if (holds.length === 0) return 0;
+  const ids = new Set(holds.map(h => h.id));
+  db.get('reservations').remove(r => ids.has(r.id)).write();
+  const touched = new Map();
+  for (const h of holds) {
+    const v = getVariantRef(h.productoId, h.varianteId).value();
+    if (!v) continue;
+    pushLog(h.productoId, h.varianteId, {
+      action, reservation_id: h.id, session_id: h.sessionId, tn_variant_id: h.tnVariantId || undefined,
+      delta: 0, stock: toNum(v.stock), reason: reasonFn(h)
+    });
+    touched.set(`${h.productoId}|${h.varianteId}`, h);
+  }
+  for (const h of touched.values()) {
+    syncVariante(h.productoId, h.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
+  }
+  emitChange('stock', {});
+  return holds.length;
+}
+
+function holdLabel(h) {
+  const m = h.matchId ? db.get('matchs').find({ id: h.matchId }).value() : null;
+  return m ? `Combo ${m.nombre} · ` : '';
+}
+
+// Consume reservas del canal vendido (las del mismo canal; las de otros diseños se respetan)
+function consumeHolds(productoId, varianteId, channel, qty) {
+  const now = Date.now();
+  const candidates = db.get('reservations').value()
+    .filter(r => isHold(r) && r.expiresAt > now && r.productoId === productoId && r.varianteId === varianteId
+      && (String(r.tnVariantId || '') === String(channel) || !r.tnVariantId))
+    .sort((a, b) => (toNum(b.qty) === qty) - (toNum(a.qty) === qty) || toNum(a.createdAt) - toNum(b.createdAt));
+  let left = qty;
+  const consumed = [];
+  for (const r of candidates) {
+    if (left <= 0) break;
+    const q = toNum(r.qty);
+    if (q <= left) {
+      db.get('reservations').remove({ id: r.id }).value();
+      left -= q;
+      consumed.push(r.id);
+    } else {
+      r.qty = q - left;
+      left = 0;
+      consumed.push(r.id);
+    }
+  }
+  db.write();
+  return consumed;
 }
 
 // ─── Cron: liberar reservas expiradas cada 60 seg ───────────────────────────
-setInterval(async () => {
+async function releaseExpiredReservations() {
   const now = Date.now();
-  const expired = db.get('reservations').filter(r => r.expiresAt <= now).value();
-  if (expired.length === 0) return;
+  const expired = db.get('reservations').value().filter(r => r.expiresAt <= now);
+  if (expired.length === 0) return 0;
   console.log(`[RESERVAS] Liberando ${expired.length} reserva(s) expirada(s)...`);
-  for (const r of expired) {
-    const prod = db.get('productos').find({ id: r.productoId }).value();
-    if (!prod) continue;
-    const variante = prod.variantes.find(v => v.id === r.varianteId);
-    if (!variante) continue;
-    const qty = toNum(r.qty);
+  return dropHolds(expired, 'cart_expired',
+    h => `${holdLabel(h)}Sesión ${h.sessionId ? String(h.sessionId).slice(0, 8) : '?'} · Carrito abandonado (30 min)`);
+}
 
+// ─── Migración de datos (corre al arrancar, es idempotente) ─────────────────
+function migrateDb() {
+  // 1. Índice de idempotencia de órdenes a partir de los logs (antes vivía solo en el log)
+  if (!db.get('meta.order_items_backfilled').value()) {
+    const items = db.get('order_items').value();
+    for (const p of db.get('productos').value()) {
+      for (const v of p.variantes || []) {
+        const returned = new Set();
+        for (const e of v.log || []) if (e.action === 'return' && e.order_id) returned.add(String(e.order_id));
+        for (const e of v.log || []) {
+          if (e.action !== 'sale' || !e.order_id) continue;
+          const key = itemKey(String(e.order_id), p.id, v.id, e.tn_variant_id || '');
+          items[key] = { state: returned.has(String(e.order_id)) ? 'returned' : 'sold', qty: Math.abs(toNum(e.delta)), ts: e.ts, backfilled: true };
+        }
+      }
+    }
+    db.set('meta.order_items_backfilled', true).write();
+  }
+
+  // 2. Reservas viejas → modo "hold". Las de combos descontaban stock: se devuelve
+  //    y pasan a retener por canal (el contenedor del combo, si se puede deducir).
+  const reservations = db.get('reservations').value();
+  const legacyByGroup = new Map();
+  for (const r of reservations) {
+    if (r.kind) continue;
     if (r.matchReservationId) {
-      // Reserva de Match: SÍ se descontó stock al reservar, hay que devolverlo
-      const newStock = toNum(variante.stock) + qty;
-      db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
-        .assign({ stock: newStock }).get('log').unshift({
-          ts: new Date().toISOString(), action: 'reservation_expired',
-          reservation_id: r.id, delta: +qty, stock: newStock,
-          reason: `Match · Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Expiró sin pago (30 min)`
-        }).write();
-      syncVariante(r.productoId, r.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
-      console.log(`[RESERVAS] Match ${prod.nombre}/${variante.label}: stock restaurado → ${newStock}`);
+      if (!legacyByGroup.has(r.matchReservationId)) legacyByGroup.set(r.matchReservationId, []);
+      legacyByGroup.get(r.matchReservationId).push(r);
     } else {
-      // Reserva normal: NO se descontó stock, solo loguear el abandono
-      db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
-        .get('log').unshift({
-          ts: new Date().toISOString(), action: 'cart_expired',
-          reservation_id: r.id, delta: 0, stock: toNum(variante.stock),
-          reason: `Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Carrito abandonado (30 min)`
-        }).write();
-      console.log(`[RESERVAS] Carrito expirado (sin descuento): ${prod.nombre}/${variante.label}`);
+      r.kind = 'hold';
+      r.createdAt = r.createdAt || Date.now();
     }
   }
-  db.get('reservations').remove(r => r.expiresAt <= now).write();
-}, 60 * 1000);
+  for (const group of legacyByGroup.values()) {
+    const ids = new Set(group.map(r => String(r.tnVariantId)));
+    let channel = null;
+    for (const m of db.get('matchs').value()) {
+      const vm = (m.variantMap || []).find(x => ids.has(String(x.v1id)) && (ids.size === 1 || ids.has(String(x.v2id))));
+      if (vm && group.length === 2) { channel = String(vm.tn_variant_id); break; }
+    }
+    for (const r of group) {
+      const v = getVariantRef(r.productoId, r.varianteId).value();
+      if (v) {
+        const newStock = toNum(v.stock) + toNum(r.qty);
+        v.stock = newStock;
+        if (!Array.isArray(v.log)) v.log = [];
+        v.log.unshift({
+          ts: new Date().toISOString(), action: 'reservation_released', reservation_id: r.id,
+          delta: +toNum(r.qty), stock: newStock,
+          reason: 'Migración: la reserva de combo deja de descontar stock (ahora retiene la unidad en el carrito)'
+        });
+      }
+      r.kind = 'hold';
+      r.tnVariantId = channel;
+      r.createdAt = r.createdAt || Date.now();
+    }
+  }
+  db.write();
+}
 
-// ─── Helper: re-sincronizar TODOS los matchs (compartido entre endpoint admin y cron) ─
-// Recorre cada Match, lee el stock real de los productos individuales en TN y
-// actualiza el stock del contenedor a min(s1, s2). Devuelve resumen de cambios.
-async function resyncAllMatchs() {
+// ─── Re-sincronizar TODOS los combos (endpoint admin, tarea y cron) ─────────
+// Lee el stock actual de cada contenedor en TN y actualiza solo los combos cuyo
+// valor difiere de lo que corresponde según SC (min de los dos lados).
+async function resyncAllMatchs(onProgress) {
   const matchs = db.get('matchs').value();
   const results = [];
-  const productCache = {};
-
-  async function getProductVariants(tn_product_id) {
-    if (productCache[tn_product_id]) return productCache[tn_product_id];
-    const data = await tnRequest('GET', `/products/${tn_product_id}?fields=id,variants`);
-    const map = Object.fromEntries(data.variants.map(v => [String(v.id), toNum(v.stock)]));
-    productCache[tn_product_id] = map;
-    return map;
-  }
-
-  for (const match of matchs) {
+  const ctx = {};
+  for (let i = 0; i < matchs.length; i++) {
+    const match = matchs[i];
+    if (onProgress) onProgress({ current: i, total: matchs.length, message: match.nombre });
     if (!match.tn_match_product_id || !match.variantMap) {
       results.push({ id: match.id, nombre: match.nombre, skipped: true, reason: 'sin tn_match_product_id o variantMap' });
       continue;
     }
     try {
-      const p1varMap = await getProductVariants(match.producto1.tn_product_id);
-      await new Promise(r => setTimeout(r, 400));
-      const p2varMap = await getProductVariants(match.producto2.tn_product_id);
-      await new Promise(r => setTimeout(r, 400));
-
-      let updated = 0;
+      const container = await tnRequest('GET', `/products/${match.tn_match_product_id}?fields=id,variants`);
+      const actual = new Map((container.variants || []).map(v => [String(v.id), v.stock === null || v.stock === undefined ? null : toNum(v.stock)]));
+      let updated = 0, missing = 0;
       const changes = [];
+      const errors = [];
       for (const vm of match.variantMap) {
-        const s1 = p1varMap[vm.v1id];
-        const s2 = p2varMap[vm.v2id];
-        if (s1 === undefined || s2 === undefined) continue;
-        const newStock = Math.min(s1, s2);
+        if (!actual.has(String(vm.tn_variant_id))) { missing++; continue; }
         try {
-          await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
-          updated++;
-          changes.push({ label: vm.label, new: newStock });
+          const value = await computeComboStock(match, vm, ctx);
+          if (value === undefined) continue;
+          const before = actual.get(String(vm.tn_variant_id));
+          if (before !== value) {
+            await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: value });
+            updated++;
+            changes.push({ label: vm.label, old: before, new: value });
+          }
+          vm.tn_stock = value; delete vm.sync_error;
         } catch (e) {
-          if (/too many requests/i.test(e.message)) {
-            await new Promise(r => setTimeout(r, 2000));
-            try {
-              await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
-              updated++;
-              changes.push({ label: vm.label, new: newStock });
-            } catch (e2) { throw e2; }
-          } else { throw e; }
+          vm.sync_error = e.message;
+          errors.push({ label: vm.label, error: e.message });
         }
-        await new Promise(r => setTimeout(r, 400));
       }
-      results.push({ id: match.id, nombre: match.nombre, updated, changes_count: changes.length });
+      db.write();
+      results.push({ id: match.id, nombre: match.nombre, updated, changes_count: changes.length, changes, missing_in_tn: missing, errors });
     } catch (e) {
       results.push({ id: match.id, nombre: match.nombre, error: e.message });
       console.error(`[RESYNC-MATCHS] Error en "${match.nombre}":`, e.message);
     }
-    await new Promise(r => setTimeout(r, 800));
   }
+  if (onProgress) onProgress({ current: matchs.length, total: matchs.length, message: 'Listo' });
+  emitChange('matchs');
   const totalUpdated = results.reduce((a, r) => a + (r.updated || 0), 0);
   return { total_matchs: matchs.length, processed: results.length, total_updated: totalUpdated, results };
 }
 
-// ─── Cron: reconciliar stock cada 6 horas ────────────────────────────────────
-setInterval(async () => {
-  console.log('[RECONCILIAR] Iniciando chequeo de stock...');
-  const productos = db.get('productos').value();
-  let corregidos = 0, chequeados = 0, errores = 0;
-
-  for (const prod of productos) {
-    for (const variante of prod.variantes) {
-      if (!variante.links || variante.links.length === 0) continue;
-
-      // Tomar el primer link como referencia del stock en TN
-      const link = variante.links[0];
-      try {
-        const tnVariant = await tnRequest('GET', `/products/${link.product_id}/variants/${link.variant_id}`);
-        chequeados++;
-        const tnStock = tnVariant.stock !== undefined && tnVariant.stock !== null ? toNum(tnVariant.stock) : null;
-
-        // Si el stock en TN difiere del de Stock Central, corregir
-        if (tnStock !== null && tnStock !== toNum(variante.stock)) {
-          console.log(`[RECONCILIAR] Discrepancia: ${prod.nombre}/${variante.label} | SC: ${variante.stock} | TN: ${tnStock} → corrigiendo SC`);
-          db.get('productos').find({ id: prod.id }).get('variantes').find({ id: variante.id })
-            .assign({ stock: tnStock }).get('log').unshift({
-              ts: new Date().toISOString(), action: 'reconciled',
-              delta: tnStock - toNum(variante.stock), stock: tnStock,
-              reason: `Reconciliación automática (SC: ${variante.stock} → TN: ${tnStock})`
-            }).write();
-          corregidos++;
-        }
-      } catch (e) {
-        errores++;
-        console.warn(`[RECONCILIAR] Error chequeando ${prod.nombre}/${variante.label}:`, e.message);
+// Todas las variantes de TN con su stock, en bloque (200 por página)
+async function fetchAllTnVariantStocks() {
+  const map = new Map();
+  for (let page = 1; page < 200; page++) {
+    let batch;
+    try {
+      batch = await tnRequest('GET', `/products?per_page=200&page=${page}&fields=id,variants`);
+    } catch (e) {
+      if (/last page is/i.test(e.message) || e.status === 404) break;
+      throw e;
+    }
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    for (const p of batch) {
+      for (const v of p.variants || []) {
+        map.set(String(v.id), { product_id: String(p.id), stock: v.stock === null || v.stock === undefined ? null : toNum(v.stock) });
       }
+    }
+    if (batch.length < 200) break;
+  }
+  return map;
+}
 
-      // Pequeña pausa para no saturar la API de TN
-      await new Promise(r => setTimeout(r, 200));
+// ─── Reconciliación SC → TN: SC es la fuente de verdad ──────────────────────
+// Compara lo que muestra TN en cada producto vinculado con lo que corresponde
+// según SC; si difiere, corrige TN (no SC) y deja una alerta para revisar.
+async function reconcileProducts(onProgress) {
+  const tnStocks = await fetchAllTnVariantStocks();
+  const productos = db.get('productos').value();
+  let chequeados = 0, corregidos = 0, errores = 0, faltantes = 0;
+  const total = productos.reduce((a, p) => a + (p.variantes || []).length, 0);
+  let current = 0;
+  for (const prod of productos) {
+    for (const variante of prod.variantes || []) {
+      if (onProgress) onProgress({ current: current++, total, message: `${prod.nombre} · ${variante.label}` });
+      for (const link of variante.links || []) {
+        const actual = tnStocks.get(String(link.variant_id));
+        if (!actual) { faltantes++; link.missing_in_tn = true; continue; }
+        delete link.missing_in_tn;
+        chequeados++;
+        const expected = channelStock(allocation(prod.id, variante.id), link.variant_id);
+        if (actual.stock === expected) { link.tn_stock = expected; delete link.sync_error; continue; }
+        try {
+          await tnRequest('PUT', `/products/${link.product_id}/variants/${link.variant_id}`, { stock: expected });
+          link.tn_stock = expected; delete link.sync_error;
+          corregidos++;
+          if (channelStock(allocation(prod.id, variante.id), link.variant_id) !== expected) {
+            syncVariante(prod.id, variante.id).catch(e => console.error('[RECONCILIAR] Sync:', e.message));
+          }
+          console.log(`[RECONCILIAR] ${prod.nombre}/${variante.label} (${link.label}): TN ${actual.stock} → ${expected}`);
+          addAlert({
+            key: `discrepancy|${prod.id}|${variante.id}|${link.variant_id}`, type: 'discrepancy', severity: 'warning', reopen: true,
+            title: `Tiendanube tenía otro stock: ${prod.nombre} · ${variante.label}`,
+            detail: `${link.label}: TN mostraba ${actual.stock === null ? 'sin control de stock' : actual.stock}, SC dice ${expected}. Se corrigió Tiendanube.`,
+            productoId: prod.id, varianteId: variante.id, variant_id: String(link.variant_id)
+          });
+        } catch (e) {
+          errores++;
+          link.sync_error = e.message;
+          console.warn(`[RECONCILIAR] Error corrigiendo ${prod.nombre}/${variante.label}:`, e.message);
+        }
+      }
     }
   }
+  db.write();
+  emitChange('stock', {});
+  return { chequeados, corregidos, errores, faltantes };
+}
 
-  console.log(`[RECONCILIAR] Completado: ${chequeados} chequeados, ${corregidos} corregidos, ${errores} errores`);
+// ─── Revisión de órdenes: procesa las que no llegaron por webhook ───────────
+// Se responde 200 al webhook antes de procesar: si el server se reinicia en el
+// medio (deploy), el evento se pierde. Esto lo recupera. Es idempotente.
+// Nunca procesa órdenes anteriores a la primera vez que corrió (catchup_since).
+async function catchUpOrders(onProgress) {
+  const since0 = db.get('meta.catchup_since').value();
+  if (!since0) {
+    setMeta('catchup_since', new Date().toISOString());
+    return { first_run: true, revisadas: 0, procesadas: 0 };
+  }
+  const floor = Date.parse(since0);
+  const since = new Date(Math.max(floor, Date.now() - 3 * 86400e3)).toISOString();
+  let revisadas = 0, procesadas = 0;
+  for (let page = 1; page < 100; page++) {
+    let batch;
+    try {
+      batch = await tnRequest('GET', `/orders?updated_at_min=${encodeURIComponent(since)}&per_page=50&page=${page}`);
+    } catch (e) {
+      if (/last page is/i.test(e.message) || e.status === 404) break;
+      throw e;
+    }
+    if (!Array.isArray(batch) || batch.length === 0) break;
+    for (const order of batch) {
+      revisadas++;
+      if (onProgress) onProgress({ current: revisadas, total: revisadas, message: `Orden #${order.number || order.id}` });
+      if (Date.parse(order.created_at) < floor) continue;
+      const event = order.status === 'cancelled' ? 'order/cancelled' : 'order/created';
+      try {
+        const r = await processOrderEvent(event, order.id, order, { source: 'catchup' });
+        if (r && r.changed) procesadas++;
+      } catch (e) { console.warn(`[CATCHUP] Orden ${order.id}:`, e.message); }
+    }
+    if (batch.length < 50) break;
+  }
+  setMeta('last_catchup_at', new Date().toISOString());
+  if (procesadas > 0) console.log(`[CATCHUP] ${procesadas} línea(s) de órdenes recuperadas`);
+  return { revisadas, procesadas };
+}
 
-  // Agregar variantes faltantes a los matchs (ej: nuevos talles agregados a productos individuales)
-  console.log('[REPAIR-MATCHS] Iniciando reparación de variantes faltantes...');
+// ─── Ciclo completo (cron 6h y tarea manual) ─────────────────────────────────
+async function runReconcileCycle(onProgress) {
+  const step = (n, message) => onProgress && onProgress({ current: n, total: 4, message });
+  const summary = {};
+  console.log('[RECONCILIAR] Iniciando ciclo...');
+  step(0, 'Revisando órdenes recientes');
+  try { summary.ordenes = await catchUpOrders(); } catch (e) { summary.ordenes = { error: e.message }; }
+  step(1, 'Comparando stock con Tiendanube');
+  try { summary.productos = await reconcileProducts(); } catch (e) { summary.productos = { error: e.message }; console.error('[RECONCILIAR] Error:', e.message); }
+  step(2, 'Agregando talles faltantes a combos');
   try {
     const r = await repairAllMatchVariants();
-    if (r.total_added > 0 || r.total_failed > 0) {
-      console.log(`[REPAIR-MATCHS] Completado: ${r.total_added} agregadas, ${r.total_failed} fallaron (de ${r.total_missing} faltantes)`);
-    } else {
-      console.log(`[REPAIR-MATCHS] Completado: sin variantes faltantes`);
-    }
-  } catch (e) {
-    console.error('[REPAIR-MATCHS] Error general:', e.message);
-  }
-
-  // Re-sincronizar contenedores de matchs después de reconciliar productos individuales
-  console.log('[RESYNC-MATCHS] Iniciando re-sincronización de contenedores...');
+    summary.repair = { total_added: r.total_added, total_failed: r.total_failed, total_missing: r.total_missing };
+  } catch (e) { summary.repair = { error: e.message }; console.error('[REPAIR-MATCHS] Error general:', e.message); }
+  step(3, 'Actualizando stock de combos');
   try {
     const r = await resyncAllMatchs();
-    console.log(`[RESYNC-MATCHS] Completado: ${r.processed}/${r.total_matchs} matchs, ${r.total_updated} variantes actualizadas`);
-  } catch (e) {
-    console.error('[RESYNC-MATCHS] Error general:', e.message);
-  }
-}, 6 * 60 * 60 * 1000); // cada 6 horas
+    summary.matchs = { processed: r.processed, total_updated: r.total_updated };
+  } catch (e) { summary.matchs = { error: e.message }; console.error('[RESYNC-MATCHS] Error general:', e.message); }
+  step(4, 'Listo');
+  setMeta('last_reconcile_at', new Date().toISOString());
+  setMeta('last_reconcile', summary);
+  console.log('[RECONCILIAR] Ciclo completo:', JSON.stringify(summary));
+  return summary;
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Config
@@ -411,7 +919,11 @@ app.post('/api/config', (req, res) => {
   res.json({ ok: true });
 });
 app.post('/api/config/test', async (req, res) => {
-  try { await tnRequest('GET', '/products?per_page=1'); res.json({ ok: true, store_name: 'Tienda conectada OK' }); }
+  try {
+    const s = await tnRequest('GET', '/store');
+    const name = s && s.name ? (typeof s.name === 'object' ? (s.name.es || Object.values(s.name)[0]) : s.name) : '';
+    res.json({ ok: true, store_name: name ? `Conectado a ${name}` : 'Tienda conectada OK' });
+  }
   catch (e) { res.status(400).json({ ok: false, error: e.message }); }
 });
 app.post('/api/config/webhook', async (req, res) => {
@@ -466,7 +978,10 @@ app.post('/api/admin/webhooks/clean-and-register', async (req, res) => {
 // Productos
 // ════════════════════════════════════════════════════════════════════════════
 
-app.get('/api/productos', (req, res) => res.json(db.get('productos').value()));
+app.get('/api/productos', (req, res) => {
+  if (req.query.lite && req.query.lite !== '0') return res.json(productosLite());
+  res.json(db.get('productos').value());
+});
 
 app.post('/api/productos', (req, res) => {
   const { id, nombre } = req.body;
@@ -480,6 +995,8 @@ app.post('/api/productos', (req, res) => {
 
 app.delete('/api/productos/:id', (req, res) => {
   db.get('productos').remove({ id: req.params.id }).write();
+  db.get('reservations').remove(r => r.productoId === req.params.id).write();
+  emitChange('stock', {});
   res.json({ ok: true });
 });
 
@@ -537,7 +1054,7 @@ app.post('/api/productos/:id/sync-variantes', async (req, res) => {
       const varId = `var_${Date.now()}_${Math.random().toString(36).substr(2,4)}`;
       const nueva = {
         id: varId, label: vLabel, stock,
-        links: [{ product_id: tnProductId, variant_id: tnVId, label }],
+        links: [{ product_id: tnProductId, variant_id: tnVId, label, linked_at: new Date().toISOString() }],
         log: [{ ts: new Date().toISOString(), action: 'created', stock, reason: 'Importada desde TN (sync-variantes)' }]
       };
       db.get('productos').find({ id: req.params.id }).get('variantes').push(nueva).write();
@@ -560,7 +1077,7 @@ app.post('/api/productos/:id/variantes', (req, res) => {
   if (!label) return res.status(400).json({ error: 'Falta label' });
   const prod = db.get('productos').find({ id: req.params.id }).value();
   if (!prod) return res.status(404).json({ error: 'Producto no encontrado' });
-  const varId = `var_${Date.now()}`;
+  const varId = `var_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
   const nueva = { id: varId, label, stock: parseInt(stock) || 0, links: [], log: [{ ts: new Date().toISOString(), action: 'created', stock: parseInt(stock) || 0 }] };
   db.get('productos').find({ id: req.params.id }).get('variantes').push(nueva).write();
   res.json(nueva);
@@ -573,21 +1090,34 @@ app.put('/api/productos/:id/variantes/:varId/stock', async (req, res) => {
   if (!prod) return res.status(404).json({ error: 'Producto no encontrado' });
   const variante = prod.variantes.find(v => v.id === varId);
   if (!variante) return res.status(404).json({ error: 'Variante no encontrada' });
+  const isAbsolute = absolute !== undefined && absolute !== null && absolute !== '';
+  if (isAbsolute && !Number.isFinite(Number(absolute))) return res.status(400).json({ error: 'El stock tiene que ser un número' });
+  if (!isAbsolute && !Number.isFinite(Number(delta))) return res.status(400).json({ error: 'El ajuste tiene que ser un número' });
   const currentStock = toNum(variante.stock);
-  let newStock = absolute !== undefined ? toNum(absolute) : currentStock + toNum(delta);
+  let newStock = Math.round(isAbsolute ? toNum(absolute) : currentStock + toNum(delta));
   if (newStock < 0) newStock = 0;
-  db.get('productos').find({ id }).get('variantes').find({ id: varId })
-    .assign({ stock: newStock }).get('log').unshift({
-      ts: new Date().toISOString(), action: absolute !== undefined ? 'set' : toNum(delta) > 0 ? 'add' : 'subtract',
-      delta: toNum(delta) || (newStock - currentStock), stock: newStock, reason: reason || ''
-    }).write();
+  pushLog(id, varId, {
+    action: isAbsolute ? 'set' : toNum(delta) > 0 ? 'add' : 'subtract',
+    delta: newStock - currentStock, stock: newStock, reason: reason || ''
+  }, { stock: newStock });
   let syncResult = null;
-  if (sync) { try { syncResult = await syncVariante(id, varId); } catch (e) { syncResult = { ok: false, error: e.message }; } }
+  if (sync) {
+    // Se espera al sync hasta 5 s; si TN tarda más, sigue atrás y los errores llegan por alertas/SSE
+    const p = syncVariante(id, varId, null, { force: true });
+    const timeout = new Promise(r => setTimeout(() => r(null), 5000));
+    try { syncResult = await Promise.race([p, timeout]); } catch (e) { syncResult = { ok: false, error: e.message }; }
+    if (syncResult === null) {
+      p.catch(e => console.error('[STOCK] Sync en segundo plano:', e.message));
+      syncResult = { ok: true, pending: true, updated: 0, total: (variante.links || []).length, errors: [] };
+    }
+  }
   res.json({ ok: true, stock: newStock, sync: syncResult });
 });
 
 app.delete('/api/productos/:id/variantes/:varId', (req, res) => {
   db.get('productos').find({ id: req.params.id }).get('variantes').remove({ id: req.params.varId }).write();
+  db.get('reservations').remove(r => r.productoId === req.params.id && r.varianteId === req.params.varId).write();
+  emitChange('stock', { productoId: req.params.id });
   res.json({ ok: true });
 });
 
@@ -622,8 +1152,12 @@ app.post('/api/sync-link', async (req, res) => {
     return res.status(400).json({ error: 'Faltan datos' });
   }
   try {
-    await tnRequest('PUT', `/products/${product_id}/variants/${variant_id}`, { stock });
-    res.json({ ok: true, variant_id, stock });
+    // Un link gestionado siempre recibe lo que corresponde según SC (respeta las reservas por diseño)
+    const internal = findInternalByTnVariant(variant_id);
+    const value = internal ? channelStock(allocation(internal.productoId, internal.varianteId), variant_id) : stock;
+    await tnRequest('PUT', `/products/${product_id}/variants/${variant_id}`, { stock: value });
+    if (internal) { internal.link.tn_stock = value; delete internal.link.sync_error; db.write(); }
+    res.json({ ok: true, variant_id, stock: value });
   } catch (e) {
     res.status(500).json({ ok: false, variant_id, error: e.message });
   }
@@ -641,7 +1175,7 @@ app.post('/api/productos/:id/variantes/:varId/sync', async (req, res) => {
     try {
       const result = await syncVariante(req.params.id, req.params.varId, (progress) => {
         sendEvent({ type: 'progress', ...progress });
-      });
+      }, { force: true });
       sendEvent({ type: 'done', ...result });
     } catch (e) {
       sendEvent({ type: 'error', error: e.message });
@@ -649,7 +1183,7 @@ app.post('/api/productos/:id/variantes/:varId/sync', async (req, res) => {
     res.end();
     return;
   }
-  try { res.json(await syncVariante(req.params.id, req.params.varId)); }
+  try { res.json(await syncVariante(req.params.id, req.params.varId, null, { force: true })); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -665,10 +1199,17 @@ app.post('/api/productos/:id/variantes/:varId/links', (req, res) => {
   if (!prod) return res.status(404).json({ error: 'Producto no encontrado' });
   const variante = prod.variantes.find(v => v.id === varId);
   if (!variante) return res.status(404).json({ error: 'Variante no encontrada' });
-  if (variante.links.find(l => l.variant_id === String(variant_id))) return res.status(409).json({ error: 'Ya vinculada' });
+  const already = findInternalByTnVariant(variant_id);
+  if (already) {
+    return res.status(409).json({ error: already.varianteId === varId ? 'Ya está vinculada a esta variante' : `Esa variante de Tiendanube ya está vinculada a ${already.prod.nombre} · ${already.variante.label}` });
+  }
   db.get('productos').find({ id }).get('variantes').find({ id: varId }).get('links').push({
-    product_id: String(product_id), variant_id: String(variant_id), label: label || `P:${product_id} V:${variant_id}`
+    product_id: String(product_id), variant_id: String(variant_id), label: label || `P:${product_id} V:${variant_id}`,
+    linked_at: new Date().toISOString()
   }).write();
+  emitChange('stock', { productoId: id });
+  // El producto nuevo de TN pasa a mostrar el stock de SC
+  syncVariante(id, varId).catch(e => console.error('[LINK] Sync:', e.message));
   res.json({ ok: true });
 });
 
@@ -683,171 +1224,96 @@ app.delete('/api/productos/:id/variantes/:varId/links/:variant_id', (req, res) =
 // ════════════════════════════════════════════════════════════════════════════
 
 // POST /api/reserve — el storefront llama esto cuando agrega al carrito
-app.post('/api/reserve', async (req, res) => {
-  const { sessionId, variant_id, qty = 1 } = req.body;
-  if (!sessionId || !variant_id) return res.status(400).json({ error: 'Faltan sessionId o variant_id' });
-  const clienteIP = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'IP desconocida';
-  const sessionShort = sessionId.slice(0, 8);
-
-  // Buscar la variante interna que tenga este link
-  const productos = db.get('productos').value();
-  let foundProd = null, foundVar = null;
-  for (const p of productos) {
-    for (const v of p.variantes) {
-      if (v.links.some(l => l.variant_id === String(variant_id))) { foundProd = p; foundVar = v; break; }
-    }
-    if (foundProd) break;
-  }
-
-  if (!foundProd || !foundVar) {
-    // Verificar si es un variant de un Match contenedor
-    const matchResult = findMatchByContainerVariant(variant_id);
-    if (matchResult) {
-      const { match, vm } = matchResult;
-      console.log(`[MATCH-RESERVA] Reservando Match: ${match.nombre} | combo: ${vm.label}`);
-      const matchResId = `mres_${Date.now()}`;
-      // Reservar ambas variantes individuales
-      await Promise.all([
-        reservarVarianteIndividual(sessionId, vm.v1id, qty, matchResId),
-        reservarVarianteIndividual(sessionId, vm.v2id, qty, matchResId)
-      ]);
-      return res.json({ ok: true, managed: true, match: match.nombre, combo: vm.label });
-    }
-    return res.json({ ok: true, managed: false, reason: 'Variante no gestionada por Stock Central' });
-  }
-
+// Producto normal: retiene la unidad en el diseño elegido (los demás diseños que
+// comparten el stock bajan en TN). Combo: retiene en las dos variantes individuales.
+// Si no hay disponible → 409 y no se reserva nada.
+// Límite simple por IP: 40 pedidos por minuto por defecto (un cliente real hace muy pocos)
+const RESERVE_RATE_PER_MIN = Math.max(1, toNum(process.env.SC_RESERVE_RATE_PER_MIN) || 40);
+const reserveHits = new Map();
+function reserveRateLimited(ip) {
   const now = Date.now();
+  const h = reserveHits.get(ip) || { n: 0, since: now };
+  if (now - h.since > 60000) { h.n = 0; h.since = now; }
+  h.n++;
+  reserveHits.set(ip, h);
+  if (reserveHits.size > 5000) for (const [k, v] of reserveHits) if (now - v.since > 60000) reserveHits.delete(k);
+  return h.n > RESERVE_RATE_PER_MIN;
+}
+const MAX_HELD_PER_SESSION = 10; // unidades por sesión y variante
 
-  // Validar stock disponible (TN será quien bloquee en checkout si llega a 0)
-  if (toNum(foundVar.stock) < toNum(qty)) {
-    return res.status(409).json({ ok: false, error: 'Stock insuficiente', available: toNum(foundVar.stock) });
+app.post('/api/reserve', (req, res) => {
+  const { sessionId, variant_id } = req.body || {};
+  const ipKey = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || '?';
+  if (reserveRateLimited(ipKey)) return res.status(429).json({ error: 'Demasiados pedidos, probá en un minuto' });
+  if (!sessionId || !variant_id) return res.status(400).json({ error: 'Faltan sessionId o variant_id' });
+  const rawQty = req.body.qty === undefined || req.body.qty === null ? 1 : Number(req.body.qty);
+  if (!Number.isInteger(rawQty) || rawQty < 1 || rawQty > 50) return res.status(400).json({ error: 'qty tiene que ser un entero entre 1 y 50' });
+  const qty = rawQty;
+  if (String(sessionId).length > 100) return res.status(400).json({ error: 'sessionId inválido' });
+  const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'IP desconocida';
+  const channel = String(variant_id);
+
+  const internal = findInternalByTnVariant(channel);
+  if (internal) {
+    const r = placeHolds(String(sessionId), [{ ...internal, qty }], channel, { ip });
+    if (!r.ok) return res.status(409).json({ ok: false, error: 'Stock insuficiente', available: r.available });
+    console.log(`[RESERVAS] ${r.duplicate ? 'Duplicada (ignorada)' : r.accumulated ? 'Acumulada' : 'Nueva'}: sesión ${String(sessionId).slice(0, 8)} ${internal.prod.nombre}/${internal.variante.label} qty ${qty}`);
+    return res.json({ ok: true, managed: true, reservation_id: r.ids[0], updated: !!r.accumulated, duplicate: !!r.duplicate });
   }
 
-  // Verificar si ya existe reserva activa para esta sesion Y este variant_id especifico de TN
-  const existing = db.get('reservations')
-    .find(r => r.sessionId === sessionId && r.tnVariantId === String(variant_id) && r.expiresAt > now)
-    .value();
-
-  if (existing) {
-    // Acumular qty (sin descontar stock — TN es la fuente de verdad para la concurrencia)
-    const extraQty = toNum(qty);
-    const newQty = toNum(existing.qty) + extraQty;
-
-    db.get('reservations').find({ id: existing.id })
-      .assign({ qty: newQty, expiresAt: now + RESERVATION_MS }).write();
-
-    db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
-      .get('log').unshift({
-        ts: new Date().toISOString(), action: 'cart_added',
-        reservation_id: existing.id, session_id: sessionId,
-        delta: 0, stock: toNum(foundVar.stock),
-        reason: `Sesión ${sessionShort} · ${clienteIP} · +${extraQty} (carrito, qty ${newQty})`
-      }).write();
-
-    console.log(`[RESERVAS] Acumulada (sin descontar): sesion ${sessionId} tnVariant ${variant_id} qty ${existing.qty}+${extraQty}=${newQty}`);
-    return res.json({ ok: true, managed: true, reservation_id: existing.id, updated: true });
+  const matchResult = findMatchByContainerVariant(channel);
+  if (matchResult) {
+    const { match, vm } = matchResult;
+    const sides = [];
+    for (const tnId of [vm.v1id, vm.v2id]) {
+      const int = findInternalByTnVariant(tnId);
+      if (!int) { console.warn(`[MATCH-RESERVA] ${match.nombre}: variante ${tnId} no está gestionada en SC, no se retiene`); continue; }
+      const same = sides.find(s => s.productoId === int.productoId && s.varianteId === int.varianteId);
+      if (same) same.qty += qty; else sides.push({ ...int, qty });
+    }
+    if (sides.length === 0) return res.json({ ok: true, managed: false, reason: 'Combo sin productos gestionados por Stock Central' });
+    const r = placeHolds(String(sessionId), sides, channel, {
+      ip, matchId: match.id, matchName: match.nombre, label: vm.label, comboGroupId: `mres_${Date.now()}`
+    });
+    if (!r.ok) return res.status(409).json({ ok: false, error: 'Stock insuficiente', available: r.available, match: match.nombre, combo: vm.label });
+    console.log(`[MATCH-RESERVA] ${match.nombre} | ${vm.label} | sesión ${String(sessionId).slice(0, 8)} qty ${qty}`);
+    return res.json({ ok: true, managed: true, match: match.nombre, combo: vm.label, reservation_ids: r.ids });
   }
-
-  // Nueva reserva — solo tracking, NO descontar stock ni sincronizar con TN
-  // Esto evita el bug donde TN bloqueaba al propio cliente que tiene el producto en su carrito
-  const reservationId = `res_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-
-  db.get('reservations').push({
-    id: reservationId, sessionId,
-    productoId: foundProd.id, varianteId: foundVar.id,
-    tnVariantId: String(variant_id),
-    qty: toNum(qty), expiresAt: now + RESERVATION_MS
-  }).write();
-
-  db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
-    .get('log').unshift({
-      ts: new Date().toISOString(), action: 'cart_added',
-      reservation_id: reservationId, session_id: sessionId,
-      delta: 0, stock: toNum(foundVar.stock),
-      reason: `Sesión ${sessionShort} · ${clienteIP} · carrito (qty ${qty})`
-    }).write();
-
-  console.log(`[RESERVAS] Nueva (sin descontar): sesion ${sessionId} ${foundProd.nombre}/${foundVar.label} qty ${qty}`);
-
-  res.json({ ok: true, managed: true, reservation_id: reservationId });
+  return res.json({ ok: true, managed: false, reason: 'Variante no gestionada por Stock Central' });
 });
 
-// DELETE /api/reserve/:sessionId — liberar reserva (cliente vacía carrito)
-app.delete('/api/reserve/:sessionId', async (req, res) => {
+// DELETE /api/reserve/:sessionId — liberar reserva (cliente vacía carrito o saca un producto)
+app.delete('/api/reserve/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const { variant_id } = req.query;
-  const now = Date.now();
-
   let toRelease;
   if (variant_id) {
-    // Verificar si es un variant de un Match contenedor
-    const matchResult = findMatchByContainerVariant(variant_id);
-    if (matchResult) {
-      const { match, vm } = matchResult;
-      // Liberar reservas de ambas variantes individuales del match
-      toRelease = db.get('reservations')
-        .filter(r => r.sessionId === sessionId && r.expiresAt > now &&
-          (r.tnVariantId === vm.v1id || r.tnVariantId === vm.v2id))
-        .value();
-    } else {
-      // Buscar productoId/varianteId por variant_id de TN normal
-      const productos = db.get('productos').value();
-      let foundProd = null, foundVar = null;
-      for (const p of productos) {
-        for (const v of p.variantes) {
-          if (v.links.some(l => l.variant_id === String(variant_id))) { foundProd = p; foundVar = v; break; }
-        }
-        if (foundProd) break;
-      }
-      if (!foundVar) return res.json({ ok: true, released: 0 });
-      toRelease = db.get('reservations')
-        .filter(r => r.sessionId === sessionId && r.varianteId === foundVar.id && r.expiresAt > now)
-        .value();
+    const channel = String(variant_id);
+    toRelease = activeHolds(r => r.sessionId === sessionId && String(r.tnVariantId || '') === channel);
+    if (toRelease.length === 0) {
+      // reservas viejas sin canal: buscar por la variante interna
+      const internal = findInternalByTnVariant(channel);
+      if (internal) toRelease = activeHolds(r => r.sessionId === sessionId && !r.tnVariantId && r.productoId === internal.productoId && r.varianteId === internal.varianteId);
     }
   } else {
-    toRelease = db.get('reservations')
-      .filter(r => r.sessionId === sessionId && r.expiresAt > now)
-      .value();
+    toRelease = activeHolds(r => r.sessionId === sessionId);
   }
+  const released = dropHolds(toRelease, 'cart_released',
+    h => `${holdLabel(h)}Sesión ${h.sessionId ? String(h.sessionId).slice(0, 8) : '?'} · Carrito vaciado`);
+  if (released) console.log(`[RESERVAS] Liberadas ${released} reserva(s) de sesión ${sessionId}`);
+  res.json({ ok: true, released });
+});
 
-  if (toRelease.length === 0) return res.json({ ok: true, released: 0 });
-
-  for (const r of toRelease) {
-    const prod = db.get('productos').find({ id: r.productoId }).value();
-    if (!prod) continue;
-    const variante = prod.variantes.find(v => v.id === r.varianteId);
-    if (!variante) continue;
-    const qty = toNum(r.qty);
-
-    if (r.matchReservationId) {
-      // Reserva de Match: devolver stock a la variante individual
-      const newStock = toNum(variante.stock) + qty;
-      db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
-        .assign({ stock: newStock }).get('log').unshift({
-          ts: new Date().toISOString(), action: 'reservation_released',
-          reservation_id: r.id, delta: +qty, stock: newStock,
-          reason: `Match · Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Carrito vaciado`
-        }).write();
-      syncVariante(r.productoId, r.varianteId).catch(e => console.error('[RESERVAS] Sync error:', e.message));
-    } else {
-      // Reserva normal: solo loguear, no se descontó stock al reservar
-      db.get('productos').find({ id: r.productoId }).get('variantes').find({ id: r.varianteId })
-        .get('log').unshift({
-          ts: new Date().toISOString(), action: 'cart_released',
-          reservation_id: r.id, delta: 0, stock: toNum(variante.stock),
-          reason: `Sesión ${r.sessionId ? r.sessionId.slice(0,8) : '?'} · Carrito vaciado`
-        }).write();
-    }
-  }
-
-  if (variant_id) {
-    db.get('reservations').remove(r => r.sessionId === sessionId && toRelease.some(t => t.id === r.id)).write();
-  } else {
-    db.get('reservations').remove({ sessionId }).write();
-  }
-
-  console.log(`[RESERVAS] Liberadas ${toRelease.length} reserva(s) de sesion ${sessionId}`);
-  res.json({ ok: true, released: toRelease.length });
+// Alias para versiones viejas del script del storefront (/api/reservations con variantId / ?sku=)
+app.post('/api/reservations', (req, res, next) => {
+  if (req.body && req.body.variant_id === undefined) req.body.variant_id = req.body.variantId;
+  req.url = '/api/reserve';
+  app.handle(req, res, next);
+});
+app.delete('/api/reservations/:sessionId', (req, res, next) => {
+  const v = req.query.variant_id || req.query.sku;
+  req.url = `/api/reserve/${encodeURIComponent(req.params.sessionId)}${v ? `?variant_id=${encodeURIComponent(v)}` : ''}`;
+  app.handle(req, res, next);
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -879,265 +1345,255 @@ app.get('/api/tn-products', async (req, res) => {
 // Webhook de órdenes
 // ════════════════════════════════════════════════════════════════════════════
 
-app.post('/webhook/order', async (req, res) => {
-  res.sendStatus(200);
-  const { event, id: order_id, store_id } = req.body;
-  console.log(`[WEBHOOK] ${event} | Orden: ${order_id}`);
-  try {
-    const fetch = (await import('node-fetch')).default;
-    const { access_token } = db.get('config').value();
-    const orderRes = await fetch(`https://api.tiendanube.com/2025-03/${store_id}/orders/${order_id}`, {
-      headers: { 'Authentication': `bearer ${access_token}`, 'User-Agent': 'StockCentral (soporte@minch.com.ar)' }
-    });
-    const order = await orderRes.json();
-    const clienteNombre = order.contact_name || (order.customer ? `${order.customer.name || ''} ${order.customer.last_name || ''}`.trim() : '') || 'Desconocido';
-    const clienteEmail = order.contact_email || order.customer?.email || '';
-    // Detectar método de pago para distinguir transferencias en el log
-    const paymentMethod = order.payment_details?.method || order.gateway || order.payment_method || '';
-    const isTransfer = /transfer|deposit|cash|efectivo/i.test(paymentMethod);
-    const paymentTag = isTransfer ? ' [TRANSFERENCIA]' : '';
-
-    for (const item of order.products || []) {
-      const { variant_id, quantity } = item;
-      const productos = db.get('productos').value();
-      let foundProd = null, foundVar = null;
-      for (const p of productos) {
-        for (const v of p.variantes) {
-          if (v.links.some(l => l.variant_id === String(variant_id))) {
-            foundProd = p;
-            foundVar = db.get('productos').find({ id: p.id }).get('variantes').find({ id: v.id }).value();
-            break;
-          }
-        }
-        if (foundProd) break;
-      }
-
-      // ─── Caso especial: variant es contenedor de un Match ────────────────
-      // Diseño: SC es fuente única de verdad. Buscamos los productos individuales
-      // del combo en SC (los buzos están dados de alta como productos gestionados),
-      // descontamos ahí, registramos en Actividad, y syncVariante propaga a TN.
-      if (!foundProd || !foundVar) {
-        const matchFound = db.get('matchs').find(m =>
-          m.variantMap && m.variantMap.some(vm => vm.tn_variant_id === String(variant_id))
-        ).value();
-
-        if (matchFound && (event === 'order/created' || event === 'order/paid')) {
-          const vm = matchFound.variantMap.find(vm => vm.tn_variant_id === String(variant_id));
-
-          // Helper: encontrar producto/variante interno de SC a partir de tn_variant_id
-          const findInternal = (tnVarId) => {
-            for (const p of db.get('productos').value()) {
-              for (const v of p.variantes) {
-                if (v.links && v.links.some(l => String(l.variant_id) === String(tnVarId))) {
-                  return { productoId: p.id, varianteId: v.id, prod: p, variante: v };
-                }
-              }
-            }
-            return null;
-          };
-
-          const ind1 = findInternal(vm.v1id);
-          const ind2 = findInternal(vm.v2id);
-
-          // Idempotencia: si la orden+variant_id del contenedor de este match ya descontó, no repetir.
-          // Guardamos el variant_id del combo (no del buzo individual) para diferenciar entre
-          // dos matchs distintos que compartan los mismos buzos individuales.
-          const already1 = ind1 && orderAlreadyDiscounted(ind1.productoId, ind1.varianteId, order_id, variant_id);
-          const already2 = ind2 && orderAlreadyDiscounted(ind2.productoId, ind2.varianteId, order_id, variant_id);
-          if (already1 || already2) {
-            if (event === 'order/paid') {
-              console.log(`[WEBHOOK] Match orden ${order_id}: pago confirmado (stock ya descontado en order/created)`);
-            } else {
-              console.log(`[WEBHOOK] Match orden ${order_id} line item ${variant_id} ya procesado, ignorando duplicado.`);
-            }
-            continue;
-          }
-
-          console.log(`[WEBHOOK] Match detectado: ${matchFound.nombre} | variante: ${vm.label}${paymentTag}`);
-
-          // Descontar buzo 1 en SC
-          if (ind1) {
-            // Buscar reservas de match: si existen, ya descontaron stock, hay que hacer rollback silencioso
-            // para que el descuento de la venta no sea doble.
-            const now = Date.now();
-            const matchReservas = db.get('reservations')
-              .filter(r => r.productoId === ind1.productoId && r.varianteId === ind1.varianteId
-                        && r.matchReservationId && r.expiresAt > now)
-              .value();
-            let reservedQty = 0;
-            for (const r of matchReservas) {
-              reservedQty += toNum(r.qty);
-              db.get('reservations').remove({ id: r.id }).write();
-            }
-            // stockBefore = stock "real" antes de la reserva
-            const stockBefore = toNum(ind1.variante.stock) + reservedQty;
-            const newStock1 = Math.max(0, stockBefore - toNum(quantity));
-            db.get('productos').find({ id: ind1.productoId }).get('variantes').find({ id: ind1.varianteId })
-              .assign({ stock: newStock1 }).get('log').unshift({
-                ts: new Date().toISOString(), action: 'sale',
-                order_id: String(order_id),
-                tn_variant_id: String(variant_id),
-                delta: -toNum(quantity), stock: newStock1,
-                reason: `[MATCH ${matchFound.nombre}] ${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${vm.label} (orden #${order_id})${paymentTag}${reservedQty ? ` · reserva consumida (${reservedQty}u)` : ''}`
-              }).write();
-            await syncVariante(ind1.productoId, ind1.varianteId).catch(e => console.error('[WEBHOOK] Sync prod1:', e.message));
-            console.log(`[WEBHOOK] Match: ${ind1.prod.nombre}/${ind1.variante.label}: ${stockBefore} → ${newStock1}${reservedQty ? ` (rollback reserva +${reservedQty})` : ''}`);
-          } else {
-            console.warn(`[WEBHOOK] Match: prod1 variante ${vm.v1id} no encontrada en SC. Saltando descuento.`);
-          }
-
-          // Descontar buzo 2 en SC
-          if (ind2) {
-            const now = Date.now();
-            const matchReservas = db.get('reservations')
-              .filter(r => r.productoId === ind2.productoId && r.varianteId === ind2.varianteId
-                        && r.matchReservationId && r.expiresAt > now)
-              .value();
-            let reservedQty = 0;
-            for (const r of matchReservas) {
-              reservedQty += toNum(r.qty);
-              db.get('reservations').remove({ id: r.id }).write();
-            }
-            const stockBefore = toNum(ind2.variante.stock) + reservedQty;
-            const newStock2 = Math.max(0, stockBefore - toNum(quantity));
-            db.get('productos').find({ id: ind2.productoId }).get('variantes').find({ id: ind2.varianteId })
-              .assign({ stock: newStock2 }).get('log').unshift({
-                ts: new Date().toISOString(), action: 'sale',
-                order_id: String(order_id),
-                tn_variant_id: String(variant_id),
-                delta: -toNum(quantity), stock: newStock2,
-                reason: `[MATCH ${matchFound.nombre}] ${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${vm.label} (orden #${order_id})${paymentTag}${reservedQty ? ` · reserva consumida (${reservedQty}u)` : ''}`
-              }).write();
-            await syncVariante(ind2.productoId, ind2.varianteId).catch(e => console.error('[WEBHOOK] Sync prod2:', e.message));
-            console.log(`[WEBHOOK] Match: ${ind2.prod.nombre}/${ind2.variante.label}: ${stockBefore} → ${newStock2}${reservedQty ? ` (rollback reserva +${reservedQty})` : ''}`);
-          } else {
-            console.warn(`[WEBHOOK] Match: prod2 variante ${vm.v2id} no encontrada en SC. Saltando descuento.`);
-          }
-
-          // Re-sincronizar el contenedor del match (min de los dos)
-          await fetch(`http://localhost:${process.env.PORT || 3001}/api/matchs/${matchFound.id}/sync-stock`, { method: 'PUT' }).catch(() => {});
-
-        } else if (matchFound && event === 'order/cancelled') {
-          const vm = matchFound.variantMap.find(vm => vm.tn_variant_id === String(variant_id));
-          const findInternal = (tnVarId) => {
-            for (const p of db.get('productos').value()) {
-              for (const v of p.variantes) {
-                if (v.links && v.links.some(l => String(l.variant_id) === String(tnVarId))) {
-                  return { productoId: p.id, varianteId: v.id, prod: p, variante: v };
-                }
-              }
-            }
-            return null;
-          };
-          const ind1 = findInternal(vm.v1id);
-          const ind2 = findInternal(vm.v2id);
-
-          // Solo devolver si la orden+variant_id previamente descontó
-          const wasProc1 = ind1 && orderAlreadyDiscounted(ind1.productoId, ind1.varianteId, order_id, variant_id);
-          const wasProc2 = ind2 && orderAlreadyDiscounted(ind2.productoId, ind2.varianteId, order_id, variant_id);
-          if (!wasProc1 && !wasProc2) {
-            console.log(`[WEBHOOK] Match orden ${order_id} line item ${variant_id} cancelado pero nunca descontó, ignorando.`);
-            continue;
-          }
-
-          if (ind1 && wasProc1) {
-            const newStock1 = toNum(ind1.variante.stock) + toNum(quantity);
-            db.get('productos').find({ id: ind1.productoId }).get('variantes').find({ id: ind1.varianteId })
-              .assign({ stock: newStock1 }).get('log').unshift({
-                ts: new Date().toISOString(), action: 'return',
-                order_id: String(order_id), delta: +toNum(quantity), stock: newStock1,
-                reason: `[MATCH ${matchFound.nombre}] Cancelación de orden #${order_id}${paymentTag}`
-              }).write();
-            await syncVariante(ind1.productoId, ind1.varianteId).catch(e => console.error('[WEBHOOK] Sync prod1:', e.message));
-            console.log(`[WEBHOOK] Match cancel: ${ind1.prod.nombre}/${ind1.variante.label}: stock devuelto → ${newStock1}`);
-          }
-          if (ind2 && wasProc2) {
-            const newStock2 = toNum(ind2.variante.stock) + toNum(quantity);
-            db.get('productos').find({ id: ind2.productoId }).get('variantes').find({ id: ind2.varianteId })
-              .assign({ stock: newStock2 }).get('log').unshift({
-                ts: new Date().toISOString(), action: 'return',
-                order_id: String(order_id), delta: +toNum(quantity), stock: newStock2,
-                reason: `[MATCH ${matchFound.nombre}] Cancelación de orden #${order_id}${paymentTag}`
-              }).write();
-            await syncVariante(ind2.productoId, ind2.varianteId).catch(e => console.error('[WEBHOOK] Sync prod2:', e.message));
-            console.log(`[WEBHOOK] Match cancel: ${ind2.prod.nombre}/${ind2.variante.label}: stock devuelto → ${newStock2}`);
-          }
-          await fetch(`http://localhost:${process.env.PORT || 3001}/api/matchs/${matchFound.id}/sync-stock`, { method: 'PUT' }).catch(() => {});
-
-        } else if (!matchFound) {
-          console.log(`[WEBHOOK] variant_id ${variant_id} no gestionada. Ignorado.`);
-        }
-        continue;
-      }
-
-      // ─── Producto normal ────────────────────────────────────────────────
-      const currentVar = db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id }).value();
-
-      if (event === 'order/created' || event === 'order/paid') {
-        // Idempotencia: si esta orden+variant_id de TN ya descontó, no repetir.
-        // Uso variant_id de TN (no la variante interna) porque un mismo SKU puede
-        // estar linkeado a varios productos de TN, y cada line item debe descontar.
-        if (orderAlreadyDiscounted(foundProd.id, foundVar.id, order_id, variant_id)) {
-          if (event === 'order/paid') {
-            // Solo marcar el pago confirmado en el log (sin tocar stock)
-            db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
-              .get('log').unshift({
-                ts: new Date().toISOString(), action: 'payment_confirmed',
-                order_id: String(order_id), delta: 0, stock: currentVar.stock,
-                reason: `Pago confirmado${paymentTag} — orden #${order_id}`
-              }).write();
-            console.log(`[WEBHOOK] Pago confirmado para orden ${order_id} (stock ya descontado en order/created)`);
-          } else {
-            console.log(`[WEBHOOK] Orden ${order_id} line item ${variant_id} ya procesado, ignorando duplicado.`);
-          }
-          continue;
-        }
-
-        // La reserva del carrito ya no descuenta stock (solo es tracking).
-        // Siempre hay que descontar al confirmar la orden, y de paso limpiar la reserva si existe.
-        const now = Date.now();
-        const activeRes = db.get('reservations')
-          .filter(r => r.productoId === foundProd.id && r.varianteId === foundVar.id && r.expiresAt > now)
-          .value();
-
-        const matchedRes = activeRes.find(r => toNum(r.qty) === toNum(quantity)) || activeRes[0];
-        const newStock = Math.max(0, toNum(currentVar.stock) - toNum(quantity));
-
-        if (matchedRes) {
-          db.get('reservations').remove({ id: matchedRes.id }).write();
-        }
-
-        db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
-          .assign({ stock: newStock }).get('log').unshift({
-            ts: new Date().toISOString(), action: 'sale',
-            order_id: String(order_id),
-            tn_variant_id: String(variant_id),
-            reservation_id: matchedRes ? matchedRes.id : undefined,
-            delta: -toNum(quantity), stock: newStock,
-            reason: `${clienteNombre}${clienteEmail ? ' · ' + clienteEmail : ''} — ${item.name || variant_id} (orden #${order_id})${paymentTag}`
-          }).write();
-        await syncVariante(foundProd.id, foundVar.id);
-        console.log(`[WEBHOOK] ${foundProd.nombre}/${foundVar.label}: ${currentVar.stock} → ${newStock} (evento ${event}${matchedRes ? ', reserva consumida' : ''})`);
-
-      } else if (event === 'order/cancelled') {
-        // Solo devolver si esta orden+variant_id previamente descontó stock
-        if (!orderAlreadyDiscounted(foundProd.id, foundVar.id, order_id, variant_id)) {
-          console.log(`[WEBHOOK] Orden ${order_id} line item ${variant_id} cancelado pero nunca descontó ${foundProd.nombre}/${foundVar.label}, ignorando.`);
-          continue;
-        }
-        const newStock = toNum(currentVar.stock) + toNum(quantity);
-        db.get('productos').find({ id: foundProd.id }).get('variantes').find({ id: foundVar.id })
-          .assign({ stock: newStock }).get('log').unshift({
-            ts: new Date().toISOString(), action: 'return',
-            order_id: String(order_id), delta: +toNum(quantity), stock: newStock,
-            reason: `Cancelación de orden #${order_id}${paymentTag}`
-          }).write();
-        await syncVariante(foundProd.id, foundVar.id);
-        console.log(`[WEBHOOK] ${foundProd.nombre}/${foundVar.label}: stock devuelto por cancelación → ${newStock}`);
-      }
+app.post('/webhook/order', (req, res) => {
+  // Verificación HMAC opcional: si TN_APP_SECRET está configurado, se rechazan webhooks no firmados por TN
+  const secret = process.env.TN_APP_SECRET;
+  if (secret) {
+    const sig = String(req.headers['x-linkedstore-hmac-sha256'] || req.headers['http_x_linkedstore_hmac_sha256'] || '');
+    const expected = crypto.createHmac('sha256', secret).update(req.rawBody || '').digest('hex');
+    if (!sig || !safeEqual(sig, expected)) {
+      console.warn('[WEBHOOK] Firma inválida, ignorado');
+      return res.sendStatus(401);
     }
-  } catch (e) { console.error('[WEBHOOK] Error:', e.message); }
+  }
+  res.sendStatus(200);
+  const { event, id: order_id } = req.body || {};
+  processOrderEvent(event, order_id).catch(e => console.error('[WEBHOOK] Error:', e.message));
 });
+
+const ORDER_EVENTS = new Set(['order/created', 'order/paid', 'order/cancelled']);
+
+// Procesa un evento de orden (order/created | order/paid | order/cancelled).
+// Separado del endpoint para poder esperarlo (tests, revisión de órdenes).
+// Devuelve { changed } = true si movió stock.
+async function processOrderEvent(event, order_id, preloadedOrder, opts = {}) {
+  if (!ORDER_EVENTS.has(event) || !order_id) {
+    console.log(`[WEBHOOK] Evento ignorado: ${event} ${order_id || ''}`);
+    return { ignored: true, changed: false };
+  }
+  if (opts.source !== 'catchup') console.log(`[WEBHOOK] ${event} | Orden: ${order_id}`);
+  let order;
+  try {
+    order = preloadedOrder || await tnRequest('GET', `/orders/${order_id}`);
+  } catch (e) {
+    addAlert({
+      key: `webhook_error|${order_id}|${event}`, type: 'webhook_error', severity: 'error',
+      title: `No se pudo leer la orden #${order_id}`,
+      detail: `${event}: ${e.message}. Se vuelve a intentar sola en la próxima revisión de órdenes.`,
+      order_id: String(order_id)
+    });
+    throw e;
+  }
+  if (opts.source !== 'catchup') setMeta('last_webhook_at', new Date().toISOString());
+
+  const ctx = {
+    event, order, source: opts.source || 'webhook',
+    order_id: String(order_id),
+    order_number: order.number ? String(order.number) : undefined,
+    cliente: order.contact_name || (order.customer ? `${order.customer.name || ''} ${order.customer.last_name || ''}`.trim() : '') || 'Desconocido',
+    email: order.contact_email || order.customer?.email || '',
+    createdAt: Date.parse(order.created_at) || null,
+    changed: false
+  };
+
+  // Un order/cancelled solo devuelve stock si la orden (leída de TN, no del body) está cancelada
+  if (event === 'order/cancelled' && order.status && order.status !== 'cancelled') {
+    console.warn(`[WEBHOOK] order/cancelled de la orden ${order_id} pero en TN figura "${order.status}". Ignorado.`);
+    return { ignored: true, changed: false };
+  }
+
+  if (event !== 'order/cancelled' && order.status === 'cancelled') {
+    // TN reintentó un created/paid de una orden que ya se canceló: si descontó antes, devolver
+    event = 'order/cancelled';
+    ctx.event = event;
+  }
+
+  for (const item of order.products || []) {
+    if (item.variant_id === null || item.variant_id === undefined) continue;
+    const qty = Math.max(0, Math.floor(toNum(item.quantity)));
+    if (!qty) continue;
+    const tnVar = String(item.variant_id);
+    // Un error en una línea no corta las demás
+    try {
+      const internal = findInternalByTnVariant(tnVar);
+      if (internal) { await processDirectItem(ctx, item, tnVar, qty, internal); continue; }
+
+      const matchResult = findMatchByContainerVariant(tnVar);
+      if (matchResult) { await processComboItem(ctx, item, tnVar, qty, matchResult.match, matchResult.vm); continue; }
+    } catch (e) {
+      console.error(`[WEBHOOK] Orden ${order_id} línea ${tnVar}:`, e.message);
+      addAlert({
+        key: `webhook_error|${ctx.order_id}|${tnVar}`, type: 'webhook_error', severity: 'error',
+        title: `Error procesando la orden #${ctx.order_number || ctx.order_id}`,
+        detail: `Línea ${item.name || tnVar}: ${e.message}`, order_id: ctx.order_id, variant_id: tnVar
+      });
+      continue;
+    }
+
+    if (event !== 'order/cancelled') {
+      console.log(`[WEBHOOK] variant_id ${tnVar} no gestionada. Ignorado.`);
+      addAlert({
+        key: `unlinked_sale|${ctx.order_id}|${tnVar}`, type: 'unlinked_sale', severity: 'warning', once: true,
+        title: `Venta sin capturar: ${item.name || `variante ${tnVar}`}`,
+        detail: `Orden #${ctx.order_number || ctx.order_id} (${ctx.cliente}) · ${qty}u. Ese producto de Tiendanube no está vinculado a ningún stock de SC: el stock no se descontó.`,
+        order_id: ctx.order_id, variant_id: tnVar, product_id: item.product_id ? String(item.product_id) : undefined
+      });
+    }
+  }
+  return { changed: ctx.changed };
+}
+
+function saleReason(ctx, text, prefix = '') {
+  return `${prefix}${ctx.cliente}${ctx.email ? ' · ' + ctx.email : ''} — ${text} (orden #${ctx.order_id})`;
+}
+
+function flagOversold(ctx, side, qty, before, itemName) {
+  const { productoId, varianteId } = side;
+  const prod = db.get('productos').find({ id: productoId }).value();
+  const v = getVariantRef(productoId, varianteId).value();
+  if (!prod || !v) return;
+  pushLog(productoId, varianteId, {
+    action: 'oversold', order_id: ctx.order_id, order_number: ctx.order_number, delta: 0, stock: toNum(v.stock),
+    reason: `Sobreventa: la orden #${ctx.order_id} pidió ${qty} y había ${before}`
+  });
+  addAlert({
+    key: `oversold|${ctx.order_id}|${productoId}|${varianteId}|${side.tnVar}`, type: 'oversold', severity: 'error', once: true,
+    title: `Sobreventa: ${prod.nombre} · ${v.label}`,
+    detail: `La orden #${ctx.order_number || ctx.order_id} (${ctx.cliente}${ctx.email ? ', ' + ctx.email : ''}) pidió ${qty}${itemName ? ` de ${itemName}` : ''} y había ${before}. Revisá si la podés cumplir o avisale al cliente.`,
+    order_id: ctx.order_id, productoId, varianteId, variant_id: side.tnVar
+  });
+}
+
+// Venta / cancelación de un producto vinculado directo (incluye SKU compartido)
+async function processDirectItem(ctx, item, tnVar, qty, internal) {
+  const { productoId, varianteId, prod, link } = internal;
+  if (ctx.event !== 'order/cancelled' && link.linked_at && ctx.createdAt && ctx.createdAt < Date.parse(link.linked_at)) {
+    console.log(`[WEBHOOK] Orden ${ctx.order_id}: ${tnVar} se vinculó después de la orden, no se descuenta.`);
+    return;
+  }
+  const rec = getItemRecord(ctx.order_id, productoId, varianteId, tnVar);
+  const v = getVariantRef(productoId, varianteId).value();
+
+  if (ctx.event === 'order/cancelled') {
+    if (!rec || rec.state !== 'sold') {
+      console.log(`[WEBHOOK] Orden ${ctx.order_id} línea ${tnVar}: cancelada pero ${rec ? 'ya devuelta' : 'nunca descontó'}, ignorando.`);
+      return;
+    }
+    const back = toNum(rec.qty) || qty;
+    setItemRecord(ctx.order_id, productoId, varianteId, tnVar, { state: 'returned', qty: back });
+    const newStock = toNum(v.stock) + back;
+    pushLog(productoId, varianteId, {
+      action: 'return', order_id: ctx.order_id, order_number: ctx.order_number, tn_variant_id: tnVar,
+      delta: +back, stock: newStock, client: ctx.cliente, email: ctx.email || undefined,
+      reason: `Cancelación de orden #${ctx.order_id}`
+    }, { stock: newStock });
+    ctx.changed = true;
+    await syncVariante(productoId, varianteId, null, { force: [tnVar] }).catch(e => console.error('[WEBHOOK] Sync:', e.message));
+    console.log(`[WEBHOOK] ${prod.nombre}/${v.label}: stock devuelto por cancelación → ${newStock}`);
+    return;
+  }
+
+  if (rec) {
+    if (ctx.event === 'order/paid' && rec.state === 'sold' && !rec.paid) {
+      setItemRecord(ctx.order_id, productoId, varianteId, tnVar, { paid: true });
+      pushLog(productoId, varianteId, {
+        action: 'payment_confirmed', order_id: ctx.order_id, order_number: ctx.order_number, tn_variant_id: tnVar,
+        delta: 0, stock: toNum(v.stock), client: ctx.cliente, reason: `Pago confirmado — orden #${ctx.order_id}`
+      });
+      console.log(`[WEBHOOK] Pago confirmado para orden ${ctx.order_id} (stock ya descontado en order/created)`);
+    } else if (ctx.source !== 'catchup') {
+      console.log(`[WEBHOOK] Orden ${ctx.order_id} línea ${tnVar} ya procesada, ignorando duplicado.`);
+    }
+    return;
+  }
+
+  // Marcar ANTES de cualquier await: un evento duplicado concurrente ya la ve procesada
+  setItemRecord(ctx.order_id, productoId, varianteId, tnVar, { state: 'sold', qty, paid: ctx.event === 'order/paid' });
+  const consumed = consumeHolds(productoId, varianteId, tnVar, qty);
+  const before = toNum(v.stock);
+  const newStock = Math.max(0, before - qty);
+  pushLog(productoId, varianteId, {
+    action: 'sale', order_id: ctx.order_id, order_number: ctx.order_number, tn_variant_id: tnVar,
+    reservation_id: consumed[0], delta: -qty, stock: newStock,
+    client: ctx.cliente, email: ctx.email || undefined, item_name: item.name || undefined,
+    reason: saleReason(ctx, item.name || tnVar) + (ctx.source === 'catchup' ? ' · recuperada en revisión de órdenes' : '')
+  }, { stock: newStock });
+  ctx.changed = true;
+  if (before < qty) flagOversold(ctx, { productoId, varianteId, tnVar }, qty, before, item.name);
+  await syncVariante(productoId, varianteId, null, { force: [tnVar] }).catch(e => console.error('[WEBHOOK] Sync:', e.message));
+  console.log(`[WEBHOOK] ${prod.nombre}/${v.label}: ${before} → ${newStock} (evento ${ctx.event}${consumed.length ? ', reserva consumida' : ''})`);
+}
+
+// Venta / cancelación de un combo: descuenta en las dos variantes individuales de SC
+async function processComboItem(ctx, item, tnVar, qty, match, vm) {
+  if (ctx.event !== 'order/cancelled' && match.createdAt && ctx.createdAt && ctx.createdAt < Date.parse(match.createdAt)) return;
+  const sides = [];
+  for (const tnId of [vm.v1id, vm.v2id]) {
+    const int = findInternalByTnVariant(tnId);
+    if (!int) {
+      console.warn(`[WEBHOOK] Match ${match.nombre}: variante ${tnId} no encontrada en SC. Saltando descuento.`);
+      if (ctx.event !== 'order/cancelled') {
+        addAlert({
+          key: `unlinked_sale|${ctx.order_id}|${tnVar}|${tnId}`, type: 'unlinked_sale', severity: 'warning', once: true,
+          title: `Combo vendido con un producto no gestionado: ${match.nombre}`,
+          detail: `Orden #${ctx.order_number || ctx.order_id} · ${vm.label}: la variante ${tnId} no está vinculada en SC, su stock no se descontó.`,
+          order_id: ctx.order_id, variant_id: String(tnId)
+        });
+      }
+      continue;
+    }
+    const same = sides.find(s => s.productoId === int.productoId && s.varianteId === int.varianteId);
+    if (same) same.qty += qty; else sides.push({ ...int, qty, tnVar });
+  }
+  if (sides.length === 0) return;
+  const prefix = `[MATCH ${match.nombre}] `;
+
+  if (ctx.event === 'order/cancelled') {
+    for (const s of sides) {
+      const rec = getItemRecord(ctx.order_id, s.productoId, s.varianteId, tnVar);
+      if (!rec || rec.state !== 'sold') continue;
+      const back = toNum(rec.qty) || s.qty;
+      setItemRecord(ctx.order_id, s.productoId, s.varianteId, tnVar, { state: 'returned', qty: back });
+      const v = getVariantRef(s.productoId, s.varianteId).value();
+      const newStock = toNum(v.stock) + back;
+      pushLog(s.productoId, s.varianteId, {
+        action: 'return', order_id: ctx.order_id, order_number: ctx.order_number, tn_variant_id: tnVar,
+        delta: +back, stock: newStock, client: ctx.cliente, match_name: match.nombre,
+        reason: `${prefix}Cancelación de orden #${ctx.order_id}`
+      }, { stock: newStock });
+      ctx.changed = true;
+      await syncVariante(s.productoId, s.varianteId, null, { force: [tnVar] }).catch(e => console.error('[WEBHOOK] Sync:', e.message));
+    }
+    return;
+  }
+
+  const recs = sides.map(s => getItemRecord(ctx.order_id, s.productoId, s.varianteId, tnVar));
+  if (recs.some(Boolean)) {
+    if (ctx.event === 'order/paid') console.log(`[WEBHOOK] Match orden ${ctx.order_id}: pago confirmado (stock ya descontado en order/created)`);
+    else if (ctx.source !== 'catchup') console.log(`[WEBHOOK] Match orden ${ctx.order_id} línea ${tnVar} ya procesada, ignorando duplicado.`);
+    return;
+  }
+  console.log(`[WEBHOOK] Match detectado: ${match.nombre} | variante: ${vm.label}`);
+  for (const s of sides) setItemRecord(ctx.order_id, s.productoId, s.varianteId, tnVar, { state: 'sold', qty: s.qty, paid: ctx.event === 'order/paid' });
+  for (const s of sides) {
+    const consumed = consumeHolds(s.productoId, s.varianteId, tnVar, s.qty);
+    const v = getVariantRef(s.productoId, s.varianteId).value();
+    const before = toNum(v.stock);
+    const newStock = Math.max(0, before - s.qty);
+    pushLog(s.productoId, s.varianteId, {
+      action: 'sale', order_id: ctx.order_id, order_number: ctx.order_number, tn_variant_id: tnVar,
+      reservation_id: consumed[0], delta: -s.qty, stock: newStock,
+      client: ctx.cliente, email: ctx.email || undefined, item_name: vm.label, match_name: match.nombre,
+      reason: saleReason(ctx, vm.label, prefix) + (consumed.length ? ` · reserva consumida` : '')
+    }, { stock: newStock });
+    ctx.changed = true;
+    if (before < s.qty) flagOversold(ctx, s, s.qty, before, `${match.nombre} (${vm.label})`);
+    console.log(`[WEBHOOK] Match: ${s.prod.nombre}/${v.label}: ${before} → ${newStock}`);
+  }
+  for (const s of sides) {
+    await syncVariante(s.productoId, s.varianteId, null, { force: [tnVar] }).catch(e => console.error('[WEBHOOK] Sync:', e.message));
+  }
+}
 
 app.post('/webhook/privacy', (req, res) => res.sendStatus(200));
 
@@ -1147,7 +1603,20 @@ app.post('/webhook/privacy', (req, res) => res.sendStatus(200));
 // ════════════════════════════════════════════════════════════════════════════
 
 app.get('/api/matchs', (req, res) => {
-  res.json(db.get('matchs').value());
+  const matchs = db.get('matchs').value();
+  if (!req.query.lite || req.query.lite === '0') return res.json(matchs);
+  res.json(matchs.map(m => {
+    const combos = (m.variantMap || []).map(vm => ({ label: vm.label, tn_variant_id: vm.tn_variant_id, stock: comboStockLocal(m, vm), sync_error: vm.sync_error || null }));
+    return {
+      id: m.id, nombre: m.nombre, tn_match_product_id: m.tn_match_product_id,
+      precio: m.precio || null, precio_promocional: m.precio_promocional || null, imagen_url: m.imagen_url || null,
+      producto1: { tn_product_id: m.producto1?.tn_product_id, nombre: m.producto1?.nombre },
+      producto2: { tn_product_id: m.producto2?.tn_product_id, nombre: m.producto2?.nombre },
+      combos_total: combos.length,
+      combos_con_stock: combos.filter(c => c.stock === null || c.stock > 0).length,
+      combos, createdAt: m.createdAt || null
+    };
+  }));
 });
 
 app.post('/api/matchs', async (req, res) => {
@@ -1267,7 +1736,7 @@ app.post('/api/matchs', async (req, res) => {
 
     // 4. Guardar match en DB con el mapa de variantes
     const nuevo = {
-      id: 'match_' + Date.now(),
+      id: `match_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`,
       nombre,
       tn_match_product_id: tnMatchProductId,
       precio: req.body.precio || null,
@@ -1275,7 +1744,14 @@ app.post('/api/matchs', async (req, res) => {
       imagen_url: req.body.imagen_url || null,
       producto1: { tn_product_id: String(producto1.tn_product_id), nombre: p1name, variantes: v1list.map(v => ({ id: String(v.id), label: getLabel(v, p1Indices), stock: v.stock })) },
       producto2: { tn_product_id: String(producto2.tn_product_id), nombre: p2name, variantes: v2list.map(v => ({ id: String(v.id), label: getLabel(v, p2Indices), stock: v.stock })) },
-      variantMap: variantMap.map((vm, i) => ({ ...vm, tn_variant_id: String(tnProduct.variants[i]?.id || '') })),
+      // TN devuelve las variantes creadas; se emparejan por sus valores (y por índice si no coinciden)
+      variantMap: variantMap.map((vm, i) => {
+        const byValues = (tnProduct.variants || []).find(tv => {
+          const vals = (tv.values || []).map(x => x && (x.es || Object.values(x)[0]));
+          return vals[0] === variantesBody[i].values[0] && vals[1] === variantesBody[i].values[1];
+        });
+        return { ...vm, tn_variant_id: String((byValues || tnProduct.variants[i] || {}).id || '') };
+      }),
       createdAt: new Date().toISOString()
     };
     
@@ -1285,6 +1761,9 @@ app.post('/api/matchs', async (req, res) => {
     }
     db.get('matchs').push(nuevo).write();
     console.log(`[MATCH] Creado: ${nombre} | TN product: ${tnMatchProductId} | ${variantesBody.length} variantes`);
+    // El stock inicial salió de TN; recalcularlo desde SC (reservas incluidas)
+    syncMatchStock(nuevo.id).catch(e => console.warn('[MATCH] Sync inicial:', e.message));
+    emitChange('matchs');
     res.json(nuevo);
   } catch (e) {
     console.error('[MATCH] Error creando:', e.message);
@@ -1335,39 +1814,43 @@ app.put('/api/matchs/:id', async (req, res) => {
 app.delete('/api/matchs/:id', async (req, res) => {
   const match = db.get('matchs').find({ id: req.params.id }).value();
   if (!match) return res.status(404).json({ error: 'Match no encontrado' });
-  try {
-    // Eliminar producto contenedor de TN
-    if (match.tn_match_product_id) {
-      await tnRequest('DELETE', `/products/${match.tn_match_product_id}`).catch(e => {
-        console.warn('[MATCH] No se pudo eliminar producto TN:', e.message);
-      });
+  // Si no se pudo borrar en TN, el combo queda: si no, el contenedor seguiría vendiendo sin descontar
+  if (match.tn_match_product_id) {
+    try { await tnRequest('DELETE', `/products/${match.tn_match_product_id}`); }
+    catch (e) {
+      if (e.status !== 404) return res.status(502).json({ error: `No se pudo borrar el combo en Tiendanube: ${e.message}. No se borró nada.` });
     }
-  } catch (e) { console.warn('[MATCH] Error eliminando en TN:', e.message); }
+  }
   db.get('matchs').remove({ id: req.params.id }).write();
+  emitChange('matchs');
   res.json({ ok: true });
 });
 
 // PUT /api/matchs/:id/sync-stock — recalcular stock del contenedor basado en productos individuales
-app.put('/api/matchs/:id/sync-stock', async (req, res) => {
-  const match = db.get('matchs').find({ id: req.params.id }).value();
-  if (!match) return res.status(404).json({ error: 'Match no encontrado' });
-  try {
-    const [p1data, p2data] = await Promise.all([
-      tnRequest('GET', `/products/${match.producto1.tn_product_id}?fields=id,variants`),
-      tnRequest('GET', `/products/${match.producto2.tn_product_id}?fields=id,variants`)
-    ]);
-    const p1varMap = Object.fromEntries(p1data.variants.map(v => [String(v.id), v.stock]));
-    const p2varMap = Object.fromEntries(p2data.variants.map(v => [String(v.id), v.stock]));
-    let updated = 0;
-    for (const vm of (match.variantMap || [])) {
-      const s1 = p1varMap[vm.v1id] ?? null;
-      const s2 = p2varMap[vm.v2id] ?? null;
-      const newStock = (s1 === null && s2 === null) ? null : Math.min(s1 === null ? 9999 : s1, s2 === null ? 9999 : s2);
-      await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
+// Recalcula y empuja el stock de todos los combos de un match (forzado)
+async function syncMatchStock(matchId) {
+  const match = db.get('matchs').find({ id: matchId }).value();
+  if (!match) { const e = new Error('Match no encontrado'); e.status = 404; throw e; }
+  const ctx = {};
+  let updated = 0;
+  const errors = [];
+  for (const vm of (match.variantMap || [])) {
+    if (!vm.tn_variant_id) continue;
+    try {
+      const value = await computeComboStock(match, vm, ctx);
+      if (value === undefined) continue;
+      await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: value });
+      vm.tn_stock = value; delete vm.sync_error;
       updated++;
-    }
-    res.json({ ok: true, updated });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    } catch (e) { vm.sync_error = e.message; errors.push({ label: vm.label, error: e.message }); }
+  }
+  db.write();
+  emitChange('matchs');
+  return { ok: errors.length === 0, updated, errors };
+}
+app.put('/api/matchs/:id/sync-stock', async (req, res) => {
+  try { res.json(await syncMatchStock(req.params.id)); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
 // POST /api/admin/matchs/resync-all — re-sincronizar TODOS los matchs de una vez
@@ -1383,7 +1866,7 @@ app.post('/api/admin/matchs/resync-all', async (req, res) => {
 // Detecta combinaciones de variantes individuales que no están en cada contenedor
 // y las crea en TN. Bug histórico: al crear un match se filtraban variantes con
 // stock 0, y al agregar talles nuevos a un producto, los matchs viejos no los incluyen.
-async function repairAllMatchVariants() {
+async function repairAllMatchVariants(onProgress) {
   const matchs = db.get('matchs').value();
   const results = [];
   const productCache = {};
@@ -1421,7 +1904,8 @@ async function repairAllMatchVariants() {
     return match ? match[1] : name.split(' ').slice(-1)[0];
   }
 
-  for (const match of matchs) {
+  for (const [mi, match] of matchs.entries()) {
+    if (onProgress) onProgress({ current: mi, total: matchs.length, message: match.nombre });
     if (!match.tn_match_product_id || !match.variantMap || !match.producto1?.tn_product_id || !match.producto2?.tn_product_id) {
       results.push({ id: match.id, nombre: match.nombre, skipped: true, reason: 'datos incompletos' });
       continue;
@@ -1526,6 +2010,7 @@ async function repairAllMatchVariants() {
     }
     await new Promise(r => setTimeout(r, 800));
   }
+  if (onProgress) onProgress({ current: matchs.length, total: matchs.length, message: 'Listo' });
   const totalAdded = results.reduce((a, r) => a + (r.added || 0), 0);
   const totalFailed = results.reduce((a, r) => a + (r.failed || 0), 0);
   const totalMissing = results.reduce((a, r) => a + (r.missing || 0), 0);
@@ -1541,6 +2026,381 @@ app.post('/api/admin/matchs/repair-variants', async (req, res) => {
     const result = await repairAllMatchVariants();
     res.json({ ok: true, ...result });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Panel: salud, resumen, stock liviano, actividad, alertas, tareas y eventos
+// ════════════════════════════════════════════════════════════════════════════
+
+const PKG_VERSION = (() => { try { return require('./package.json').version; } catch (_) { return '0'; } })();
+const STARTED_AT = Date.now();
+const DEFAULT_LOGO = 'https://acdn-us.mitiendanube.com/stores/001/443/972/themes/common/logo-1516620265-1747438419-3be83f5e868d070c706e3e78edcc8ad01747438419-320-0.webp';
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true, auth_required: !!ADMIN_TOKEN,
+    version: `${PKG_VERSION}${process.env.RAILWAY_GIT_COMMIT_SHA ? '+' + process.env.RAILWAY_GIT_COMMIT_SHA.slice(0, 7) : ''}`,
+    uptime_s: Math.round((Date.now() - STARTED_AT) / 1000)
+  });
+});
+
+// Datos de la tienda (nombre y logo), cacheados 1 hora; nunca bloquea al panel
+let storeCache = { at: 0, data: null, loading: null };
+function getStoreInfo() {
+  const cfg = db.get('config').value();
+  const fallback = { id: cfg.store_id || '', name: 'Minch', logo_url: DEFAULT_LOGO };
+  if (storeCache.data && Date.now() - storeCache.at < 3600e3) return storeCache.data;
+  if (!storeCache.loading && cfg.access_token && cfg.store_id) {
+    storeCache.loading = tnRequest('GET', '/store').then(s => {
+      const name = typeof s.name === 'object' ? (s.name.es || Object.values(s.name)[0]) : s.name;
+      const logo = s.logo ? (String(s.logo).startsWith('//') ? 'https:' + s.logo : String(s.logo)) : DEFAULT_LOGO;
+      storeCache = { at: Date.now(), data: { id: String(s.id || cfg.store_id), name: name || 'Minch', logo_url: logo }, loading: null };
+    }).catch(() => { storeCache = { at: Date.now() - 3000e3, data: storeCache.data || fallback, loading: null }; });
+  }
+  return storeCache.data || fallback;
+}
+
+// Hora argentina (UTC-3, sin horario de verano)
+const AR_OFFSET_MS = -3 * 3600e3;
+function startOfDayAR(ts = Date.now()) {
+  const d = new Date(ts + AR_OFFSET_MS);
+  d.setUTCHours(0, 0, 0, 0);
+  return d.getTime() - AR_OFFSET_MS;
+}
+
+function buildComboIndex() {
+  const idx = new Map(); // tn variant id → Set(match ids)
+  for (const m of db.get('matchs').value()) {
+    for (const vm of m.variantMap || []) {
+      for (const id of [vm.v1id, vm.v2id]) {
+        const k = String(id);
+        if (!idx.has(k)) idx.set(k, new Set());
+        idx.get(k).add(m.id);
+      }
+    }
+  }
+  return idx;
+}
+
+function variantLite(p, v, comboIdx, since7d) {
+  const alloc = allocation(p.id, v.id);
+  const matchIds = new Set();
+  for (const l of v.links || []) for (const id of comboIdx.get(String(l.variant_id)) || []) matchIds.add(id);
+  const log = v.log || [];
+  const lastMove = log.find(e => e.action !== 'sync');
+  const lastSale = log.find(e => e.action === 'sale');
+  let vendidas7d = 0;
+  for (const e of log) {
+    if (Date.parse(e.ts) < since7d) break;
+    if (e.action === 'sale') vendidas7d += Math.abs(toNum(e.delta));
+  }
+  const syncError = (v.links || []).map(l => l.sync_error).find(Boolean) || null;
+  return {
+    id: v.id, label: v.label,
+    stock: alloc.stock, reservado: alloc.reserved, disponible: alloc.free,
+    links: (v.links || []).map(l => ({
+      product_id: l.product_id, variant_id: l.variant_id, label: l.label,
+      tn_stock: l.tn_stock === undefined ? null : l.tn_stock,
+      sync_error: l.sync_error || null, missing_in_tn: !!l.missing_in_tn
+    })),
+    matchs: matchIds.size,
+    last_movement_at: lastMove ? lastMove.ts : null,
+    last_sale_at: lastSale ? lastSale.ts : null,
+    vendidas_7d: vendidas7d,
+    sync_error: syncError
+  };
+}
+
+function productosLite() {
+  const comboIdx = buildComboIndex();
+  const since7d = Date.now() - 7 * 86400e3;
+  return db.get('productos').value().map(p => {
+    const variantes = (p.variantes || []).map(v => variantLite(p, v, comboIdx, since7d));
+    return {
+      id: p.id, nombre: p.nombre,
+      unidades: variantes.reduce((a, v) => a + v.stock, 0),
+      disponibles: variantes.reduce((a, v) => a + v.disponible, 0),
+      sin_stock: variantes.filter(v => v.disponible === 0).length,
+      variantes
+    };
+  });
+}
+
+app.get('/api/overview', (req, res) => {
+  const prods = productosLite();
+  const vars = prods.flatMap(p => p.variantes);
+  const holds = activeHolds();
+  const today = startOfDayAR();
+  const since7d = Date.now() - 7 * 86400e3;
+  const ordersToday = new Set();
+  let unitsToday = 0, units7d = 0;
+  for (const p of db.get('productos').value()) {
+    for (const v of p.variantes || []) {
+      for (const e of v.log || []) {
+        const t = Date.parse(e.ts);
+        if (t < since7d) break;
+        if (e.action !== 'sale') continue;
+        const u = Math.abs(toNum(e.delta));
+        units7d += u;
+        if (t >= today) { unitsToday += u; if (e.order_id) ordersToday.add(e.order_id); }
+      }
+    }
+  }
+  const cfg = db.get('config').value();
+  const meta = db.get('meta').value() || {};
+  res.json({
+    store: getStoreInfo(),
+    kpis: {
+      productos: prods.length, variantes: vars.length,
+      unidades: vars.reduce((a, v) => a + v.stock, 0),
+      sin_stock: vars.filter(v => v.disponible === 0).length,
+      stock_bajo: vars.filter(v => v.disponible > 0 && v.disponible <= 3).length,
+      reservas_activas: holds.length,
+      unidades_reservadas: holds.reduce((a, h) => a + toNum(h.qty), 0),
+      ventas_hoy: ordersToday.size, unidades_vendidas_hoy: unitsToday, unidades_vendidas_7d: units7d
+    },
+    alerts_open: db.get('alerts').value().filter(a => !a.dismissed).length,
+    health: {
+      tn_configured: !!(cfg.access_token && cfg.store_id),
+      webhooks_registered: !!cfg.webhook_registered,
+      last_webhook_at: meta.last_webhook_at || null,
+      last_reconcile_at: meta.last_reconcile_at || null,
+      last_catchup_at: meta.last_catchup_at || null
+    },
+    jobs: [...jobs.values()].filter(j => j.status === 'running')
+  });
+});
+
+app.get('/api/productos/:id/variantes/:varId/log', (req, res) => {
+  const p = db.get('productos').find({ id: req.params.id }).value();
+  const v = p && (p.variantes || []).find(x => x.id === req.params.varId);
+  if (!v) return res.status(404).json({ error: 'Variante no encontrada' });
+  const limit = Math.min(500, Math.max(1, toNum(req.query.limit) || 200));
+  res.json((v.log || []).slice(0, limit).map((e, i) => activityItem(p, v, e, i)));
+});
+
+// ─── Actividad ───────────────────────────────────────────────────────────────
+const ACTIONS = {
+  sale: ['sale', 'Venta'], return: ['sale', 'Devolución'], payment_confirmed: ['sale', 'Pago OK'],
+  cart_added: ['cart', 'Carrito'], cart_released: ['cart', 'Carrito liberado'], cart_expired: ['cart', 'Carrito vencido'],
+  cart_rejected: ['cart', 'Carrito rechazado'],
+  reserved: ['cart', 'Carrito'], reservation_released: ['cart', 'Carrito liberado'], reservation_expired: ['cart', 'Carrito vencido'],
+  set: ['stock', 'Ajuste'], add: ['stock', 'Ajuste'], subtract: ['stock', 'Ajuste'], created: ['stock', 'Alta'],
+  sanitized: ['stock', 'Saneo'], reconciled: ['stock', 'Reconciliación'],
+  sync: ['sync', 'Sync'], oversold: ['error', 'Sobreventa']
+};
+// Formato viejo del reason: "[MATCH X] Cliente · mail — Producto (orden #123)"
+const REASON_RE = /^(?:\[MATCH ([^\]]+)\] )?(.+?)(?: · (\S+@\S+))? — (.+?) \(orden #(\d+)\)/;
+
+function activityItem(p, v, e, i) {
+  let [category, title] = ACTIONS[e.action] || ['stock', e.action || 'Movimiento'];
+  if (e.action === 'sync' && e.errors && e.errors.length) { category = 'error'; title = 'Error de sync'; }
+  let client = e.client || null, email = e.email || null, detail = e.reason || '';
+  if ((e.action === 'sale' || e.action === 'return') && e.reason) {
+    const m = REASON_RE.exec(e.reason);
+    if (m) {
+      client = client || m[2]; email = email || m[3] || null;
+      detail = (m[1] ? `Combo ${m[1]} · ` : '') + (e.item_name || m[4]);
+    }
+  }
+  if (e.action === 'sync') {
+    detail = e.errors && e.errors.length
+      ? e.errors.map(x => `${x.label || x.variant_id}: ${x.error}`).join(' | ')
+      : `${toNum(e.links_updated)} producto(s) de TN${e.combos_updated ? ` + ${e.combos_updated} combo(s)` : ''} actualizados`;
+  }
+  return {
+    id: `${p.id}|${v.id}|${e.ts}|${i}`, ts: e.ts, action: e.action, category, title,
+    delta: e.delta === undefined ? null : toNum(e.delta), stock: e.stock === undefined ? null : toNum(e.stock),
+    productoId: p.id, producto: p.nombre, varianteId: v.id, variante: v.label,
+    order_id: e.order_id || null, order_number: e.order_number || null, client, email, detail
+  };
+}
+
+app.get('/api/activity', (req, res) => {
+  const limit = Math.min(500, Math.max(1, toNum(req.query.limit) || 100));
+  const before = req.query.before ? Date.parse(req.query.before) : Infinity;
+  const category = req.query.category && req.query.category !== 'all' ? String(req.query.category) : null;
+  const includeSync = req.query.include_sync === '1' || req.query.include_sync === 'true';
+  const q = String(req.query.q || '').trim().toLowerCase();
+  const all = [];
+  for (const p of db.get('productos').value()) {
+    for (const v of p.variantes || []) {
+      (v.log || []).forEach((e, i) => {
+        if (!(Date.parse(e.ts) < before)) return;
+        const it = activityItem(p, v, e, i);
+        if (it.category === 'sync' && !includeSync && category !== 'sync') return;
+        if (category && it.category !== category) return;
+        if (q && ![it.producto, it.variante, it.client, it.email, it.order_id, it.order_number, it.detail, it.title]
+          .some(x => x && String(x).toLowerCase().includes(q))) return;
+        all.push(it);
+      });
+    }
+  }
+  all.sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+  const items = all.slice(0, limit);
+  res.json({ items, next_before: all.length > limit ? items[items.length - 1].ts : null });
+});
+
+// ─── Alertas ─────────────────────────────────────────────────────────────────
+app.get('/api/alerts', (req, res) => {
+  const includeDismissed = req.query.include_dismissed === '1' || req.query.include_dismissed === 'true';
+  res.json(db.get('alerts').value().filter(a => includeDismissed || !a.dismissed));
+});
+app.post('/api/alerts/dismiss-all', (req, res) => {
+  let n = 0;
+  for (const a of db.get('alerts').value()) if (!a.dismissed) { a.dismissed = true; a.dismissed_at = new Date().toISOString(); n++; }
+  db.write();
+  emitChange('alerts');
+  res.json({ ok: true, dismissed: n });
+});
+app.post('/api/alerts/:id/dismiss', (req, res) => {
+  const a = db.get('alerts').value().find(x => x.id === req.params.id);
+  if (!a) return res.status(404).json({ error: 'Alerta no encontrada' });
+  a.dismissed = true; a.dismissed_at = new Date().toISOString();
+  db.write();
+  emitChange('alerts');
+  res.json({ ok: true });
+});
+
+// ─── Tareas largas con progreso ──────────────────────────────────────────────
+const jobs = new Map();
+let jobSeq = 0;
+const JOB_TYPES = {
+  'resync-matchs': { label: 'Actualizar stock de combos', run: p => resyncAllMatchs(p) },
+  'repair-matchs': { label: 'Agregar talles faltantes a combos', run: p => repairAllMatchVariants(p) },
+  'reconcile': { label: 'Revisar órdenes y stock contra Tiendanube', run: p => runReconcileCycle(p) },
+  'sync-all': { label: 'Sincronizar todo el stock a Tiendanube', run: p => syncAllVariants(null, p) },
+  'sync-product': { label: 'Sincronizar producto', run: (p, params) => syncAllVariants(params.productoId, p) }
+};
+
+async function syncAllVariants(productoId, onProgress) {
+  const list = [];
+  for (const p of db.get('productos').value()) {
+    if (productoId && p.id !== productoId) continue;
+    for (const v of p.variantes || []) list.push({ p, v });
+  }
+  if (productoId && list.length === 0 && !db.get('productos').find({ id: productoId }).value()) throw new Error('Producto no encontrado');
+  const errors = [];
+  let updated = 0;
+  for (let i = 0; i < list.length; i++) {
+    const { p, v } = list[i];
+    if (onProgress) onProgress({ current: i, total: list.length, message: `${p.nombre} · ${v.label}` });
+    try {
+      const r = await syncVariante(p.id, v.id, null, { force: true });
+      updated += r.updated + (r.combos_updated || 0);
+      for (const e of r.errors) errors.push({ label: `${p.nombre} · ${v.label} · ${e.label}`, error: e.error });
+    } catch (e) { errors.push({ label: `${p.nombre} · ${v.label}`, error: e.message }); }
+  }
+  if (onProgress) onProgress({ current: list.length, total: list.length, message: 'Listo' });
+  return { variantes: list.length, actualizados: updated, errores: errors.length, errors: errors.slice(0, 100) };
+}
+
+function startJob(type, params = {}) {
+  const def = JOB_TYPES[type];
+  if (!def) { const e = new Error(`Tarea desconocida: ${type}`); e.status = 400; throw e; }
+  for (const j of jobs.values()) {
+    if (j.type === type && j.status === 'running' && JSON.stringify(j.params) === JSON.stringify(params)) return j;
+  }
+  let label = def.label;
+  if (params.productoId) {
+    const p = db.get('productos').find({ id: params.productoId }).value();
+    label = `${def.label}: ${p ? p.nombre : params.productoId}`;
+  }
+  const job = {
+    id: `job_${Date.now()}_${++jobSeq}`, type, label, params, status: 'running',
+    progress: { current: 0, total: 0, message: 'Iniciando…' },
+    started_at: new Date().toISOString(), finished_at: null, result: null, error: null, errors: []
+  };
+  jobs.set(job.id, job);
+  while (jobs.size > 30) jobs.delete(jobs.keys().next().value);
+  emitChange('jobs', { jobId: job.id });
+  let lastEmit = 0;
+  const onProgress = (p) => {
+    job.progress = { ...job.progress, ...p };
+    if (Date.now() - lastEmit > 400) { lastEmit = Date.now(); emitChange('jobs', { jobId: job.id }); }
+  };
+  Promise.resolve()
+    .then(() => def.run(onProgress, params))
+    .then(result => {
+      job.status = 'done';
+      job.result = result;
+      job.errors = (result && Array.isArray(result.errors)) ? result.errors
+        : (result && Array.isArray(result.results)) ? result.results.filter(r => r.error).map(r => ({ label: r.nombre, error: r.error })) : [];
+    })
+    .catch(e => { job.status = 'error'; job.error = e.message; console.error(`[JOB] ${type}:`, e.message); })
+    .finally(() => {
+      job.finished_at = new Date().toISOString();
+      if (job.progress.total) job.progress.current = job.progress.total;
+      emitChange('jobs', { jobId: job.id });
+      emitChange('stock', {});
+    });
+  return job;
+}
+
+app.post('/api/jobs', (req, res) => {
+  const { type, ...params } = req.body || {};
+  try { res.json({ id: startJob(type, params).id }); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+app.get('/api/jobs', (req, res) => res.json([...jobs.values()].reverse().slice(0, 20)));
+app.get('/api/jobs/:id', (req, res) => {
+  const j = jobs.get(req.params.id);
+  if (!j) return res.status(404).json({ error: 'Tarea no encontrada (puede que el servidor se haya reiniciado)' });
+  res.json(j);
+});
+
+// ─── Eventos en vivo (SSE) ───────────────────────────────────────────────────
+app.get('/api/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+  res.write(': conectado\n\n');
+  sseClients.add(res);
+  const hb = setInterval(() => { try { res.write(': hb\n\n'); } catch (_) { /* cerrado */ } }, 25000);
+  req.on('close', () => { clearInterval(hb); sseClients.delete(res); });
+});
+
+// ─── Importar producto completo desde TN ─────────────────────────────────────
+function slugify(s) {
+  return String(s).normalize('NFD').replace(/[̀-ͯ]/g, '').toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 60) || `PRODUCTO_${Date.now()}`;
+}
+function tnVariantLabel(tnV) {
+  return (tnV.values || []).map(vv => vv && (vv.es || Object.values(vv)[0])).filter(Boolean).join(' / ') || tnV.sku || `Variante ${tnV.id}`;
+}
+
+app.post('/api/productos/import', async (req, res) => {
+  const { tn_product_id } = req.body || {};
+  if (!tn_product_id) return res.status(400).json({ error: 'Falta tn_product_id' });
+  try {
+    const tnProduct = await tnRequest('GET', `/products/${tn_product_id}?fields=id,name,variants`);
+    const pName = typeof tnProduct.name === 'object' ? (tnProduct.name.es || Object.values(tnProduct.name)[0] || '') : String(tnProduct.name || '');
+    const nombre = String(req.body.nombre || pName || `Producto ${tn_product_id}`).trim();
+    const id = slugify(req.body.id || nombre);
+    if (db.get('productos').find({ id }).value()) return res.status(409).json({ error: `Ya existe un producto con el código ${id}` });
+    const now = new Date().toISOString();
+    const variantes = [];
+    const skipped = [];
+    for (const tnV of tnProduct.variants || []) {
+      const vLabel = tnVariantLabel(tnV);
+      const already = findInternalByTnVariant(tnV.id);
+      if (already) { skipped.push({ variant_id: String(tnV.id), label: vLabel, linked_to: `${already.prod.nombre} · ${already.variante.label}` }); continue; }
+      const stock = Math.max(0, toNum(tnV.stock));
+      variantes.push({
+        id: `var_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`, label: vLabel, stock,
+        links: [{ product_id: String(tnProduct.id), variant_id: String(tnV.id), label: `${pName} · ${vLabel}`, linked_at: now, tn_stock: tnV.stock === null ? null : stock }],
+        log: [{ ts: now, action: 'created', stock, reason: `Importada desde Tiendanube (${pName})` }]
+      });
+    }
+    if (variantes.length === 0) return res.status(409).json({ error: 'Todas las variantes de ese producto ya están vinculadas a otro stock', skipped });
+    const nuevo = { id, nombre, variantes };
+    db.get('productos').push(nuevo).write();
+    emitChange('stock', { productoId: id });
+    console.log(`[IMPORT] ${nombre}: ${variantes.length} variantes (${skipped.length} ya vinculadas)`);
+    res.json({ ...nuevo, skipped });
+  } catch (e) { res.status(e.status === 404 ? 404 : 500).json({ error: e.status === 404 ? 'Ese producto no existe en Tiendanube' : e.message }); }
 });
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1568,10 +2428,47 @@ app.get('/api/stats', (req, res) => {
 // Start
 // ════════════════════════════════════════════════════════════════════════════
 
-app.listen(PORT, () => {
-  console.log(`Stock Central v2 + Reservas en puerto ${PORT}`);
-  if (process.env.ACCESS_TOKEN && process.env.STORE_ID) {
-    db.set('config.access_token', process.env.ACCESS_TOKEN).set('config.store_id', process.env.STORE_ID).write();
-    console.log(`Credenciales cargadas: store ${process.env.STORE_ID}`);
-  }
+// 404 y errores en JSON para la API (el panel muestra el mensaje)
+app.use('/api', (req, res) => res.status(404).json({ error: `Ruta no encontrada: ${req.method} ${req.originalUrl}`, code: 'not_found' }));
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  const status = err.status || err.statusCode || 500;
+  res.status(status).json({ error: status === 400 && err.type === 'entity.parse.failed' ? 'El cuerpo del pedido no es JSON válido' : err.message || 'Error interno', code: err.code || undefined });
 });
+
+migrateDb();
+
+function startBackgroundJobs() {
+  setInterval(() => releaseExpiredReservations().catch(e => console.error('[RESERVAS] Error:', e.message)), 60 * 1000);
+  // Recuperar órdenes que no llegaron por webhook (deploys, caídas)
+  setTimeout(() => catchUpOrders().catch(e => console.warn('[CATCHUP] Error:', e.message)), 30 * 1000);
+  setInterval(() => catchUpOrders().catch(e => console.warn('[CATCHUP] Error:', e.message)), 10 * 60 * 1000);
+  // Ciclo completo cada 6 horas (como tarea, para que el panel muestre el progreso).
+  // Se mira la última corrida guardada: cada deploy reinicia los timers y si no nunca llegaría a correr.
+  const RECONCILE_EVERY_MS = 6 * 60 * 60 * 1000;
+  setInterval(() => {
+    const last = Date.parse(db.get('meta.last_reconcile_started_at').value() || 0) || 0;
+    if (Date.now() - last < RECONCILE_EVERY_MS) return;
+    setMeta('last_reconcile_started_at', new Date().toISOString());
+    try { startJob('reconcile'); } catch (e) { console.error('[RECONCILIAR] Error:', e.message); }
+  }, 10 * 60 * 1000);
+}
+
+process.on('unhandledRejection', (e) => console.error('[PROCESO] Promesa rechazada sin manejar:', e && e.message ? e.message : e));
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Stock Central v2 + Reservas en puerto ${PORT}`);
+    if (process.env.ACCESS_TOKEN && process.env.STORE_ID) {
+      db.set('config.access_token', process.env.ACCESS_TOKEN).set('config.store_id', process.env.STORE_ID).write();
+      console.log(`Credenciales cargadas: store ${process.env.STORE_ID}`);
+    }
+  });
+  startBackgroundJobs();
+}
+
+module.exports = {
+  app, db, processOrderEvent, toNum, tnRequest, syncVariante, syncMatchStock, releaseExpiredReservations,
+  runReconcileCycle, resyncAllMatchs, repairAllMatchVariants, reconcileProducts, catchUpOrders,
+  allocation, channelStock, getAvailableStock, startJob, migrateDb, addAlert
+};

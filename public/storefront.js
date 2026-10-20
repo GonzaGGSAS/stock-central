@@ -22,18 +22,24 @@
   // ── Llamar al backend para reservar stock ──────────────────────────────────
   function reserveStock(variantId, qty) {
     var sessionId = getSessionId();
-    fetch(BACKEND + '/api/reservations', {
+    fetch(BACKEND + '/api/reserve', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         sessionId: sessionId,
-        variantId: String(variantId),
+        variant_id: String(variantId),
         qty: parseInt(qty) || 1
       })
     })
-    .then(function (res) { return res.json(); })
-    .then(function (data) {
-      if (data.managed) {
+    .then(function (res) { return res.json().then(function (data) { return { status: res.status, data: data }; }); })
+    .then(function (r) {
+      if (r.status === 409) {
+        // Sin stock disponible (otra persona o otro diseño ya tiene la última unidad)
+        console.warn('[StockCentral] Sin stock disponible para', variantId, r.data);
+        document.dispatchEvent(new CustomEvent('stockcentral:sin-stock', { detail: { variantId: String(variantId), available: r.data.available } }));
+        return;
+      }
+      if (r.data && r.data.managed) {
         console.log('[StockCentral] Reserva OK - variantId:', variantId, '| qty:', qty);
       }
     })
@@ -45,7 +51,7 @@
   // ── Llamar al backend para liberar stock ───────────────────────────────────
   function releaseStock(variantId) {
     var sessionId = getSessionId();
-    fetch(BACKEND + '/api/reservations/' + sessionId + (variantId ? '?sku=' + variantId : ''), {
+    fetch(BACKEND + '/api/reserve/' + sessionId + (variantId ? '?variant_id=' + encodeURIComponent(variantId) : ''), {
       method: 'DELETE'
     }).catch(function (err) {
       console.warn('[StockCentral] Error al liberar:', err.message);
