@@ -54,10 +54,12 @@ function safeEqual(a, b) {
   return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
 }
 app.use((req, res, next) => {
-  if (!ADMIN_TOKEN || !req.path.startsWith('/api/') || req.method === 'OPTIONS') return next();
-  if (req.path === '/api/health') return next();
-  if (req.path === '/api/reserve' && req.method === 'POST') return next();
-  if (req.path.startsWith('/api/reserve/') && req.method === 'DELETE') return next();
+  // Express rutea sin distinguir mayúsculas: comparar en minúsculas
+  const p = req.path.toLowerCase().replace(/\/+$/, '') || '/';
+  if (!ADMIN_TOKEN || !(p === '/api' || p.startsWith('/api/')) || req.method === 'OPTIONS') return next();
+  if (p === '/api/health') return next();
+  if (p === '/api/reserve' && req.method === 'POST') return next();
+  if (p.startsWith('/api/reserve/') && req.method === 'DELETE') return next();
   const h = String(req.headers.authorization || '');
   const token = h.startsWith('Bearer ') ? h.slice(7) : String(req.query.token || '');
   if (token && safeEqual(token, ADMIN_TOKEN)) return next();
@@ -156,10 +158,11 @@ function emitChange(topic, data = {}) {
 // Alertas — los errores que el dueño tiene que ver en el panel
 // ════════════════════════════════════════════════════════════════════════════
 const ALERTS_MAX = 300;
-function addAlert({ key, type, severity = 'warning', title, detail = '', reopen = false, ...rest }) {
+function addAlert({ key, type, severity = 'warning', title, detail = '', reopen = false, once = false, ...rest }) {
   const now = new Date().toISOString();
   const list = db.get('alerts').value();
   const existing = key ? list.find(a => a.key === key) : null;
+  if (existing && once) return existing; // mismo evento (misma orden): no se cuenta dos veces
   if (existing) {
     existing.count = (existing.count || 1) + (reopen || !existing.dismissed ? 1 : 0);
     existing.detail = detail || existing.detail;
@@ -227,6 +230,15 @@ function findMatchByContainerVariant(tn_variant_id) {
   return null;
 }
 
+// Lo que se recorta del log se agrega a un archivo aparte (una línea JSON por movimiento)
+const LOG_ARCHIVE = path.join(path.dirname(DB_PATH), 'log-archive.jsonl');
+function archiveLog(productoId, varianteId, entries) {
+  if (!entries.length) return;
+  try {
+    fs.appendFileSync(LOG_ARCHIVE, entries.map(e => JSON.stringify({ productoId, varianteId, ...e })).join('\n') + '\n');
+  } catch (e) { console.error('[LOG] No se pudo archivar:', e.message); }
+}
+
 // Agrega un movimiento al log de la variante (y opcionalmente cambia campos, ej: stock)
 function pushLog(productoId, varianteId, entry, patch) {
   const v = getVariantRef(productoId, varianteId).value();
@@ -234,7 +246,7 @@ function pushLog(productoId, varianteId, entry, patch) {
   if (patch) Object.assign(v, patch);
   if (!Array.isArray(v.log)) v.log = [];
   v.log.unshift({ ts: new Date().toISOString(), ...entry });
-  if (v.log.length > LOG_MAX) v.log.length = LOG_MAX;
+  if (v.log.length > LOG_MAX) archiveLog(productoId, varianteId, v.log.splice(LOG_MAX));
   db.write();
   emitChange('activity', { productoId });
   if (patch && 'stock' in patch) emitChange('stock', { productoId });
@@ -268,22 +280,33 @@ function activeHolds(filterFn) {
   return db.get('reservations').value().filter(r => isHold(r) && r.expiresAt > now && (!filterFn || filterFn(r)));
 }
 
+// Con más de EXACT_BELOW unidades libres no hay riesgo real de sobreventa entre diseños:
+// todos los canales muestran el stock completo y un carrito no genera PUTs a TN.
+// Cuando lo libre baja a EXACT_BELOW o menos, cada canal recibe exactamente lo suyo.
+const EXACT_BELOW = Math.max(0, toNum(process.env.SC_EXACT_BELOW || 3));
+
 function allocation(productoId, varianteId) {
   const v = getVariantRef(productoId, varianteId).value();
   const stock = Math.max(0, toNum(v && v.stock));
   let reserved = 0;
   const byChannel = new Map();
-  for (const h of activeHolds(r => r.productoId === productoId && r.varianteId === varianteId)) {
+  let left = stock; // si hay más reservado que stock, el stock se reparte por orden de llegada
+  const holds = activeHolds(r => r.productoId === productoId && r.varianteId === varianteId)
+    .sort((a, b) => toNum(a.createdAt) - toNum(b.createdAt));
+  for (const h of holds) {
     const q = toNum(h.qty);
     reserved += q;
+    const got = Math.min(q, left);
+    left -= got;
     const ch = h.tnVariantId ? String(h.tnVariantId) : '';
-    byChannel.set(ch, (byChannel.get(ch) || 0) + q);
+    byChannel.set(ch, (byChannel.get(ch) || 0) + got);
   }
   const free = Math.max(0, stock - reserved);
   return { stock, reserved, free, byChannel };
 }
 
 function channelStock(alloc, channel) {
+  if (alloc.free > EXACT_BELOW) return alloc.stock;
   return Math.max(0, Math.min(alloc.stock, alloc.free + (alloc.byChannel.get(String(channel)) || 0)));
 }
 
@@ -406,6 +429,7 @@ async function doSyncVariante({ productoId, varianteId, forceAll, force, progres
   for (const link of links) {
     const value = channelStock(allocation(productoId, varianteId), link.variant_id);
     let ok = true;
+    if (link.missing_in_tn && !forceAll) { notify({ current: ++current, total, label: link.label, ok: false }); continue; }
     if (mustPush(link.variant_id, link.tn_stock, value, !!link.sync_error)) {
       try {
         await tnRequest('PUT', `/products/${link.product_id}/variants/${link.variant_id}`, { stock: value });
@@ -414,7 +438,8 @@ async function doSyncVariante({ productoId, varianteId, forceAll, force, progres
       } catch (e) {
         ok = false;
         link.sync_error = e.message;
-        errors.push({ variant_id: link.variant_id, label: link.label, error: e.message });
+        if (e.status === 404) link.missing_in_tn = true;
+        errors.push({ variant_id: link.variant_id, label: link.label, error: e.status === 404 ? 'Esa variante ya no existe en Tiendanube (desvinculala o volvé a importarla)' : e.message });
       }
     }
     notify({ current: ++current, total, label: link.label, ok });
@@ -549,7 +574,7 @@ function placeHolds(sessionId, sides, channel, meta = {}) {
         tnVariantId: String(channel),
         qty: side.qty, expiresAt: now + RESERVATION_MS, createdAt: now,
         lastAddAt: now, lastAddQty: side.qty,
-        matchReservationId: meta.matchReservationId || null,
+        comboGroupId: meta.comboGroupId || null,
         matchId: meta.matchId || null
       }).write();
     }
@@ -1067,7 +1092,16 @@ app.put('/api/productos/:id/variantes/:varId/stock', async (req, res) => {
     delta: newStock - currentStock, stock: newStock, reason: reason || ''
   }, { stock: newStock });
   let syncResult = null;
-  if (sync) { try { syncResult = await syncVariante(id, varId, null, { force: true }); } catch (e) { syncResult = { ok: false, error: e.message }; } }
+  if (sync) {
+    // Se espera al sync hasta 5 s; si TN tarda más, sigue atrás y los errores llegan por alertas/SSE
+    const p = syncVariante(id, varId, null, { force: true });
+    const timeout = new Promise(r => setTimeout(() => r(null), 5000));
+    try { syncResult = await Promise.race([p, timeout]); } catch (e) { syncResult = { ok: false, error: e.message }; }
+    if (syncResult === null) {
+      p.catch(e => console.error('[STOCK] Sync en segundo plano:', e.message));
+      syncResult = { ok: true, pending: true, updated: 0, total: (variante.links || []).length, errors: [] };
+    }
+  }
   res.json({ ok: true, stock: newStock, sync: syncResult });
 });
 
@@ -1132,7 +1166,7 @@ app.post('/api/productos/:id/variantes/:varId/sync', async (req, res) => {
     try {
       const result = await syncVariante(req.params.id, req.params.varId, (progress) => {
         sendEvent({ type: 'progress', ...progress });
-      });
+      }, { force: true });
       sendEvent({ type: 'done', ...result });
     } catch (e) {
       sendEvent({ type: 'error', error: e.message });
@@ -1140,7 +1174,7 @@ app.post('/api/productos/:id/variantes/:varId/sync', async (req, res) => {
     res.end();
     return;
   }
-  try { res.json(await syncVariante(req.params.id, req.params.varId)); }
+  try { res.json(await syncVariante(req.params.id, req.params.varId, null, { force: true })); }
   catch (e) { res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -1187,7 +1221,9 @@ app.delete('/api/productos/:id/variantes/:varId/links/:variant_id', (req, res) =
 app.post('/api/reserve', (req, res) => {
   const { sessionId, variant_id } = req.body || {};
   if (!sessionId || !variant_id) return res.status(400).json({ error: 'Faltan sessionId o variant_id' });
-  const qty = Math.min(50, Math.max(1, Math.floor(toNum(req.body.qty === undefined ? 1 : req.body.qty)) || 1));
+  const rawQty = req.body.qty === undefined || req.body.qty === null ? 1 : Number(req.body.qty);
+  if (!Number.isInteger(rawQty) || rawQty < 1 || rawQty > 50) return res.status(400).json({ error: 'qty tiene que ser un entero entre 1 y 50' });
+  const qty = rawQty;
   if (String(sessionId).length > 100) return res.status(400).json({ error: 'sessionId inválido' });
   const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'IP desconocida';
   const channel = String(variant_id);
@@ -1212,7 +1248,7 @@ app.post('/api/reserve', (req, res) => {
     }
     if (sides.length === 0) return res.json({ ok: true, managed: false, reason: 'Combo sin productos gestionados por Stock Central' });
     const r = placeHolds(String(sessionId), sides, channel, {
-      ip, matchId: match.id, matchName: match.nombre, label: vm.label, matchReservationId: `mres_${Date.now()}`
+      ip, matchId: match.id, matchName: match.nombre, label: vm.label, comboGroupId: `mres_${Date.now()}`
     });
     if (!r.ok) return res.status(409).json({ ok: false, error: 'Stock insuficiente', available: r.available, match: match.nombre, combo: vm.label });
     console.log(`[MATCH-RESERVA] ${match.nombre} | ${vm.label} | sesión ${String(sessionId).slice(0, 8)} qty ${qty}`);
@@ -1329,6 +1365,12 @@ async function processOrderEvent(event, order_id, preloadedOrder, opts = {}) {
     return { ignored: true, changed: false };
   }
 
+  if (event !== 'order/cancelled' && order.status === 'cancelled') {
+    // TN reintentó un created/paid de una orden que ya se canceló: si descontó antes, devolver
+    event = 'order/cancelled';
+    ctx.event = event;
+  }
+
   for (const item of order.products || []) {
     if (item.variant_id === null || item.variant_id === undefined) continue;
     const qty = Math.max(0, Math.floor(toNum(item.quantity)));
@@ -1354,7 +1396,7 @@ async function processOrderEvent(event, order_id, preloadedOrder, opts = {}) {
     if (event !== 'order/cancelled') {
       console.log(`[WEBHOOK] variant_id ${tnVar} no gestionada. Ignorado.`);
       addAlert({
-        key: `unlinked_sale|${ctx.order_id}|${tnVar}`, type: 'unlinked_sale', severity: 'warning',
+        key: `unlinked_sale|${ctx.order_id}|${tnVar}`, type: 'unlinked_sale', severity: 'warning', once: true,
         title: `Venta sin capturar: ${item.name || `variante ${tnVar}`}`,
         detail: `Orden #${ctx.order_number || ctx.order_id} (${ctx.cliente}) · ${qty}u. Ese producto de Tiendanube no está vinculado a ningún stock de SC: el stock no se descontó.`,
         order_id: ctx.order_id, variant_id: tnVar, product_id: item.product_id ? String(item.product_id) : undefined
@@ -1378,7 +1420,7 @@ function flagOversold(ctx, side, qty, before, itemName) {
     reason: `Sobreventa: la orden #${ctx.order_id} pidió ${qty} y había ${before}`
   });
   addAlert({
-    key: `oversold|${ctx.order_id}|${productoId}|${varianteId}|${side.tnVar}`, type: 'oversold', severity: 'error',
+    key: `oversold|${ctx.order_id}|${productoId}|${varianteId}|${side.tnVar}`, type: 'oversold', severity: 'error', once: true,
     title: `Sobreventa: ${prod.nombre} · ${v.label}`,
     detail: `La orden #${ctx.order_number || ctx.order_id} (${ctx.cliente}${ctx.email ? ', ' + ctx.email : ''}) pidió ${qty}${itemName ? ` de ${itemName}` : ''} y había ${before}. Revisá si la podés cumplir o avisale al cliente.`,
     order_id: ctx.order_id, productoId, varianteId, variant_id: side.tnVar
@@ -1388,7 +1430,7 @@ function flagOversold(ctx, side, qty, before, itemName) {
 // Venta / cancelación de un producto vinculado directo (incluye SKU compartido)
 async function processDirectItem(ctx, item, tnVar, qty, internal) {
   const { productoId, varianteId, prod, link } = internal;
-  if (link.linked_at && ctx.createdAt && ctx.createdAt < Date.parse(link.linked_at)) {
+  if (ctx.event !== 'order/cancelled' && link.linked_at && ctx.createdAt && ctx.createdAt < Date.parse(link.linked_at)) {
     console.log(`[WEBHOOK] Orden ${ctx.order_id}: ${tnVar} se vinculó después de la orden, no se descuenta.`);
     return;
   }
@@ -1447,7 +1489,7 @@ async function processDirectItem(ctx, item, tnVar, qty, internal) {
 
 // Venta / cancelación de un combo: descuenta en las dos variantes individuales de SC
 async function processComboItem(ctx, item, tnVar, qty, match, vm) {
-  if (match.createdAt && ctx.createdAt && ctx.createdAt < Date.parse(match.createdAt)) return;
+  if (ctx.event !== 'order/cancelled' && match.createdAt && ctx.createdAt && ctx.createdAt < Date.parse(match.createdAt)) return;
   const sides = [];
   for (const tnId of [vm.v1id, vm.v2id]) {
     const int = findInternalByTnVariant(tnId);
@@ -1455,7 +1497,7 @@ async function processComboItem(ctx, item, tnVar, qty, match, vm) {
       console.warn(`[WEBHOOK] Match ${match.nombre}: variante ${tnId} no encontrada en SC. Saltando descuento.`);
       if (ctx.event !== 'order/cancelled') {
         addAlert({
-          key: `unlinked_sale|${ctx.order_id}|${tnVar}|${tnId}`, type: 'unlinked_sale', severity: 'warning',
+          key: `unlinked_sale|${ctx.order_id}|${tnVar}|${tnId}`, type: 'unlinked_sale', severity: 'warning', once: true,
           title: `Combo vendido con un producto no gestionado: ${match.nombre}`,
           detail: `Orden #${ctx.order_number || ctx.order_id} · ${vm.label}: la variante ${tnId} no está vinculada en SC, su stock no se descontó.`,
           order_id: ctx.order_id, variant_id: String(tnId)
