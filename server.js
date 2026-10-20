@@ -2165,6 +2165,7 @@ app.get('/api/overview', (req, res) => {
       webhooks_registered: !!cfg.webhook_registered,
       last_webhook_at: meta.last_webhook_at || null,
       last_reconcile_at: meta.last_reconcile_at || null,
+      last_backup_at: meta.last_backup_at || null,
       last_catchup_at: meta.last_catchup_at || null
     },
     jobs: [...jobs.values()].filter(j => j.status === 'running')
@@ -2404,6 +2405,84 @@ app.post('/api/productos/import', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
+// Copias de seguridad de la base
+// ════════════════════════════════════════════════════════════════════════════
+// Una copia por día en <carpeta de la base>/backups (en Railway: el volumen /app/data),
+// se guardan las últimas BACKUP_KEEP. Se toma del estado en memoria (consistente) y se
+// escribe de forma atómica. La marca vive en db.meta: sobrevive a los deploys.
+const BACKUP_DIR = process.env.SC_BACKUP_DIR || path.join(path.dirname(DB_PATH), 'backups');
+const BACKUP_KEEP = Math.max(1, toNum(process.env.SC_BACKUP_KEEP) || 14);
+const BACKUP_EVERY_MS = 24 * 3600e3;
+const BACKUP_RE = /^db-\d{4}-\d{2}-\d{2}\.json$/;
+
+function listBackups() {
+  try {
+    return fs.readdirSync(BACKUP_DIR).filter(f => BACKUP_RE.test(f)).sort().reverse().map(f => {
+      const st = fs.statSync(path.join(BACKUP_DIR, f));
+      return { file: f, size: st.size, created_at: st.mtime.toISOString() };
+    });
+  } catch (_) { return []; }
+}
+
+function runBackup() {
+  fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  const now = new Date();
+  setMeta('last_backup_at', now.toISOString());
+  const day = new Date(now.getTime() + AR_OFFSET_MS).toISOString().slice(0, 10); // fecha argentina
+  const file = path.join(BACKUP_DIR, `db-${day}.json`);
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(db.getState()));
+  fs.renameSync(tmp, file);
+  // Rotación: quedan las más nuevas
+  const all = fs.readdirSync(BACKUP_DIR).filter(f => BACKUP_RE.test(f)).sort().reverse();
+  for (const old of all.slice(BACKUP_KEEP)) {
+    try { fs.unlinkSync(path.join(BACKUP_DIR, old)); } catch (e) { console.warn('[BACKUP] No se pudo borrar', old, e.message); }
+  }
+  const size = fs.statSync(file).size;
+  console.log(`[BACKUP] ${path.basename(file)} (${Math.round(size / 1024)} KB), ${Math.min(all.length, BACKUP_KEEP)} copias guardadas`);
+  emitChange('backups');
+  return { file: path.basename(file), size, created_at: now.toISOString() };
+}
+
+// Hace la copia si la última tiene más de 24 h (o no hay ninguna)
+function maybeBackup() {
+  const last = Date.parse(db.get('meta.last_backup_at').value() || 0) || 0;
+  if (Date.now() - last < BACKUP_EVERY_MS && listBackups().length > 0) return null;
+  try { return runBackup(); }
+  catch (e) {
+    console.error('[BACKUP] Error:', e.message);
+    addAlert({
+      key: 'backup_error', type: 'backup_error', severity: 'error', reopen: true,
+      title: 'No se pudo hacer la copia de seguridad de la base',
+      detail: e.message
+    });
+    return null;
+  }
+}
+
+app.get('/api/admin/backups', (req, res) => {
+  res.json({
+    last_backup_at: db.get('meta.last_backup_at').value() || null,
+    keep: BACKUP_KEEP,
+    backups: listBackups()
+  });
+});
+app.post('/api/admin/backups', (req, res) => {
+  try { res.json({ ok: true, ...runBackup() }); }
+  catch (e) { res.status(500).json({ error: `No se pudo hacer la copia: ${e.message}` }); }
+});
+// Descarga de la base actual para guardarla fuera de Railway.
+// Solo con ADMIN_TOKEN activo, y sin el token de Tiendanube (se recupera de la variable ACCESS_TOKEN).
+app.get('/api/admin/backup', (req, res) => {
+  if (!ADMIN_TOKEN) return res.status(403).json({ error: 'Para descargar la base tiene que estar configurado ADMIN_TOKEN' });
+  const state = JSON.parse(JSON.stringify(db.getState()));
+  if (state.config) state.config.access_token = state.config.access_token ? '(oculto: está en la variable ACCESS_TOKEN de Railway)' : '';
+  const stamp = new Date(Date.now() + AR_OFFSET_MS).toISOString().slice(0, 16).replace(/[:T]/g, '-');
+  res.setHeader('Content-Disposition', `attachment; filename="stock-central-${stamp}.json"`);
+  res.json(state);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
 // Stats
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -2440,6 +2519,9 @@ migrateDb();
 
 function startBackgroundJobs() {
   setInterval(() => releaseExpiredReservations().catch(e => console.error('[RESERVAS] Error:', e.message)), 60 * 1000);
+  // Copia de seguridad diaria (se revisa al minuto de arrancar y después cada hora)
+  setTimeout(maybeBackup, 60 * 1000);
+  setInterval(maybeBackup, 60 * 60 * 1000);
   // Recuperar órdenes que no llegaron por webhook (deploys, caídas)
   setTimeout(() => catchUpOrders().catch(e => console.warn('[CATCHUP] Error:', e.message)), 30 * 1000);
   setInterval(() => catchUpOrders().catch(e => console.warn('[CATCHUP] Error:', e.message)), 10 * 60 * 1000);
@@ -2489,5 +2571,6 @@ if (require.main === module) {
 module.exports = {
   app, db, processOrderEvent, toNum, tnRequest, syncVariante, syncMatchStock, releaseExpiredReservations,
   runReconcileCycle, resyncAllMatchs, repairAllMatchVariants, reconcileProducts, catchUpOrders,
-  allocation, channelStock, getAvailableStock, startJob, migrateDb, addAlert
+  allocation, channelStock, getAvailableStock, startJob, migrateDb, addAlert,
+  runBackup, maybeBackup, listBackups, BACKUP_DIR
 };

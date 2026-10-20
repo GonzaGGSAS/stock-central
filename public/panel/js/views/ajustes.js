@@ -140,6 +140,49 @@ function Maintenance() {
   </section>`;
 }
 
+// Copias de seguridad: una por día en el servidor; acá se ve la última y se baja una copia
+function Backups() {
+  const r = useResource('backups', (signal) => api('/api/admin/backups', { signal }));
+  const [make, makeSt] = useAction(async () => {
+    const x = await api('/api/admin/backups', { method: 'POST', timeout: 60000 });
+    invalidate('backups', { delay: 0 });
+    toast(`Copia hecha (${fmtKb(x.size)})`);
+    return x;
+  });
+  const [download, dlSt] = useAction(async () => {
+    const data = await api('/api/admin/backup', { timeout: 60000 });
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `stock-central-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    toast('Copia descargada');
+    return true;
+  });
+  const list = r.data?.backups || [];
+  const last = r.data?.last_backup_at ? Date.parse(r.data.last_backup_at) : null;
+  const stale = last != null && Date.now() - last > 36 * 3600e3;
+  return html`<section class="card" aria-labelledby="bk-h">
+    <div class="sec-head"><h2 id="bk-h">Copias de seguridad</h2><${Refreshing} on=${r.refreshing} /></div>
+    <p class="muted small">El servidor guarda una copia de toda la base por día (las últimas ${r.data?.keep || 14}). Descargá una de vez en cuando y guardala en tu compu o en Drive.</p>
+    ${r.loading ? html`<${Skeleton} h=${48} />` : null}
+    <${ErrorBox} compact error=${r.error && !r.data ? r.error : null} title="No se pudo leer la lista de copias" onRetry=${r.reload} />
+    ${r.data ? html`<dl class="kv">
+      <dt>Última copia</dt>
+      <dd>${last ? html`<${Pill} tone=${stale ? 'warn' : 'ok'}>${fmtDate(r.data.last_backup_at)}</${Pill}>${stale ? html` <span class="small muted">hace más de un día</span>` : null}` : html`<${Pill} tone="warn">Todavía ninguna</${Pill}>`}</dd>
+      <dt>Guardadas</dt><dd>${list.length} ${list.length === 1 ? 'copia' : 'copias'}${list[0] ? html` · la última pesa ${fmtKb(list[0].size)}` : null}</dd>
+    </dl>` : null}
+    <div class="row-gap">
+      <${Button} icon="download" loading=${dlSt.loading} busyText="Descargando…" onClick=${() => download()}>Descargar copia</${Button}>
+      <${Button} kind="ghost" icon="refresh" loading=${makeSt.loading} busyText="Copiando…" onClick=${() => make()}>Hacer copia ahora</${Button}>
+    </div>
+    <${ErrorBox} compact error=${dlSt.error} title="No se pudo descargar" onRetry=${() => download()} onClose=${dlSt.reset} />
+    <${ErrorBox} compact error=${makeSt.error} title="No se pudo hacer la copia" onRetry=${() => make()} onClose=${makeSt.reset} />
+  </section>`;
+}
+function fmtKb(b) { return b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1024))} KB`; }
+
 function PanelInfo() {
   const r = useResource('health', (signal) => api('/api/health', { signal }));
   const hasTok = !!getToken();
@@ -164,6 +207,7 @@ export function Ajustes() {
   return html`<div class="view view-ajustes">
     <div class="view-head"><h1>Ajustes</h1></div>
     <${Maintenance} />
+    <${Backups} />
     <${Credentials} />
     <${Webhooks} />
     <${PanelInfo} />
