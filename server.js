@@ -2457,7 +2457,7 @@ function startBackgroundJobs() {
 process.on('unhandledRejection', (e) => console.error('[PROCESO] Promesa rechazada sin manejar:', e && e.message ? e.message : e));
 
 if (require.main === module) {
-  app.listen(PORT, () => {
+  const server = app.listen(PORT, () => {
     console.log(`Stock Central v2 + Reservas en puerto ${PORT}`);
     if (process.env.ACCESS_TOKEN && process.env.STORE_ID) {
       db.set('config.access_token', process.env.ACCESS_TOKEN).set('config.store_id', process.env.STORE_ID).write();
@@ -2465,6 +2465,25 @@ if (require.main === module) {
     }
   });
   startBackgroundJobs();
+
+  // Apagado ordenado: en cada deploy Railway manda SIGTERM a la versión vieja.
+  // Se deja de aceptar requests, se espera a que terminen los syncs a TN en curso
+  // (hasta 15 s) y se sale con código 0 (si no, Railway lo reporta como "crash").
+  let shuttingDown = false;
+  const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[PROCESO] ${signal}: cerrando ordenadamente...`);
+    server.close();
+    for (const c of sseClients) { try { c.end(); } catch (_) { /* ya cerrado */ } }
+    const deadline = Date.now() + 15000;
+    while ((syncRunning || syncQueue.size > 0) && Date.now() < deadline) await sleep(200);
+    try { db.write(); } catch (e) { console.error('[PROCESO] Error guardando la base:', e.message); }
+    console.log('[PROCESO] Listo, chau.');
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 module.exports = {
