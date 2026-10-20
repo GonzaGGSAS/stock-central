@@ -9,9 +9,14 @@ const low = require('lowdb');
 const FileSync = require('lowdb/adapters/FileSync');
 const fs = require('fs');
 
-if (!fs.existsSync('./data')) fs.mkdirSync('./data');
+const path = require('path');
 
-const adapter = new FileSync('./data/db.json');
+// DB_PATH y TN_API_BASE se pueden cambiar por env (los tests usan una DB temporal y un TN falso)
+const DB_PATH = process.env.DB_PATH || './data/db.json';
+const TN_API_BASE = (process.env.TN_API_BASE || 'https://api.tiendanube.com/2025-03').replace(/\/$/, '');
+if (!fs.existsSync(path.dirname(DB_PATH))) fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+
+const adapter = new FileSync(DB_PATH);
 const db = low(adapter);
 
 db.defaults({
@@ -28,18 +33,54 @@ const PORT = process.env.PORT || 3001;
 const RESERVATION_MS = 30 * 60 * 1000; // 30 minutos
 
 // ─── Helper: API Tiendanube ──────────────────────────────────────────────────
+// Rate limit de TN: leaky bucket de 40 requests que se vacía a 2 por segundo.
+// Todas las llamadas pasan por este bucket (capacidad 30, margen de seguridad) y
+// los 429 se reintentan con backoff, así las cascadas de syncs no revientan.
+const TN_THROTTLE = process.env.TN_THROTTLE !== 'off';
+const tnBucket = { tokens: 30, capacity: 30, perSec: 2, last: Date.now() };
+async function tnTakeToken() {
+  if (!TN_THROTTLE) return;
+  for (;;) {
+    const now = Date.now();
+    tnBucket.tokens = Math.min(tnBucket.capacity, tnBucket.tokens + ((now - tnBucket.last) / 1000) * tnBucket.perSec);
+    tnBucket.last = now;
+    if (tnBucket.tokens >= 1) { tnBucket.tokens -= 1; return; }
+    await sleep(Math.ceil(((1 - tnBucket.tokens) / tnBucket.perSec) * 1000));
+  }
+}
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
 async function tnRequest(method, path, body = null) {
   const { access_token, store_id } = db.get('config').value();
   if (!access_token || !store_id) throw new Error('No configurado');
   const fetch = (await import('node-fetch')).default;
-  const res = await fetch(`https://api.tiendanube.com/2025-03/${store_id}${path}`, {
-    method,
-    headers: { 'Authentication': `bearer ${access_token}`, 'Content-Type': 'application/json', 'User-Agent': 'StockCentral (soporte@minch.com.ar)' },
-    body: body ? JSON.stringify(body) : null
-  });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.description || `API error ${res.status}`);
-  return data;
+  const MAX_RETRIES = 4;
+  for (let attempt = 0; ; attempt++) {
+    await tnTakeToken();
+    const res = await fetch(`${TN_API_BASE}/${store_id}${path}`, {
+      method,
+      headers: { 'Authentication': `bearer ${access_token}`, 'Content-Type': 'application/json', 'User-Agent': 'StockCentral (soporte@minch.com.ar)' },
+      body: body ? JSON.stringify(body) : null
+    });
+    const text = await res.text();
+    let data = {};
+    try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { description: text.slice(0, 200) }; }
+    if (res.status === 429 && attempt < MAX_RETRIES) {
+      // x-rate-limit-reset viene en ms hasta que el bucket se vacía
+      const reset = toNum(res.headers.get('x-rate-limit-reset'));
+      const wait = Math.min(10000, Math.max(reset, 1000 * 2 ** attempt));
+      tnBucket.tokens = 0;
+      console.warn(`[TN] 429 en ${method} ${path} — reintento ${attempt + 1} en ${wait}ms`);
+      await sleep(wait);
+      continue;
+    }
+    if (!res.ok) {
+      const err = new Error(data.description || data.message || `API error ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return data;
+  }
 }
 
 // ─── Helper: Sync variante a Tiendanube ─────────────────────────────────────
@@ -235,7 +276,7 @@ async function reservarVarianteIndividual(sessionId, tn_variant_id, qty, matchRe
 }
 
 // ─── Cron: liberar reservas expiradas cada 60 seg ───────────────────────────
-setInterval(async () => {
+async function releaseExpiredReservations() {
   const now = Date.now();
   const expired = db.get('reservations').filter(r => r.expiresAt <= now).value();
   if (expired.length === 0) return;
@@ -270,7 +311,7 @@ setInterval(async () => {
     }
   }
   db.get('reservations').remove(r => r.expiresAt <= now).write();
-}, 60 * 1000);
+}
 
 // ─── Helper: re-sincronizar TODOS los matchs (compartido entre endpoint admin y cron) ─
 // Recorre cada Match, lee el stock real de los productos individuales en TN y
@@ -334,7 +375,7 @@ async function resyncAllMatchs() {
 }
 
 // ─── Cron: reconciliar stock cada 6 horas ────────────────────────────────────
-setInterval(async () => {
+async function runReconcileCycle() {
   console.log('[RECONCILIAR] Iniciando chequeo de stock...');
   const productos = db.get('productos').value();
   let corregidos = 0, chequeados = 0, errores = 0;
@@ -394,7 +435,7 @@ setInterval(async () => {
   } catch (e) {
     console.error('[RESYNC-MATCHS] Error general:', e.message);
   }
-}, 6 * 60 * 60 * 1000); // cada 6 horas
+}
 
 // ════════════════════════════════════════════════════════════════════════════
 // Config
@@ -884,12 +925,7 @@ app.post('/webhook/order', async (req, res) => {
   const { event, id: order_id, store_id } = req.body;
   console.log(`[WEBHOOK] ${event} | Orden: ${order_id}`);
   try {
-    const fetch = (await import('node-fetch')).default;
-    const { access_token } = db.get('config').value();
-    const orderRes = await fetch(`https://api.tiendanube.com/2025-03/${store_id}/orders/${order_id}`, {
-      headers: { 'Authentication': `bearer ${access_token}`, 'User-Agent': 'StockCentral (soporte@minch.com.ar)' }
-    });
-    const order = await orderRes.json();
+    const order = await tnRequest('GET', `/orders/${order_id}`);
     const clienteNombre = order.contact_name || (order.customer ? `${order.customer.name || ''} ${order.customer.last_name || ''}`.trim() : '') || 'Desconocido';
     const clienteEmail = order.contact_email || order.customer?.email || '';
     // Detectar método de pago para distinguir transferencias en el log
@@ -1015,7 +1051,7 @@ app.post('/webhook/order', async (req, res) => {
           }
 
           // Re-sincronizar el contenedor del match (min de los dos)
-          await fetch(`http://localhost:${process.env.PORT || 3001}/api/matchs/${matchFound.id}/sync-stock`, { method: 'PUT' }).catch(() => {});
+          await syncMatchStock(matchFound.id).catch(e => console.error('[WEBHOOK] Sync contenedor match:', e.message));
 
         } else if (matchFound && event === 'order/cancelled') {
           const vm = matchFound.variantMap.find(vm => vm.tn_variant_id === String(variant_id));
@@ -1062,7 +1098,7 @@ app.post('/webhook/order', async (req, res) => {
             await syncVariante(ind2.productoId, ind2.varianteId).catch(e => console.error('[WEBHOOK] Sync prod2:', e.message));
             console.log(`[WEBHOOK] Match cancel: ${ind2.prod.nombre}/${ind2.variante.label}: stock devuelto → ${newStock2}`);
           }
-          await fetch(`http://localhost:${process.env.PORT || 3001}/api/matchs/${matchFound.id}/sync-stock`, { method: 'PUT' }).catch(() => {});
+          await syncMatchStock(matchFound.id).catch(e => console.error('[WEBHOOK] Sync contenedor match:', e.message));
 
         } else if (!matchFound) {
           console.log(`[WEBHOOK] variant_id ${variant_id} no gestionada. Ignorado.`);
@@ -1348,10 +1384,10 @@ app.delete('/api/matchs/:id', async (req, res) => {
 });
 
 // PUT /api/matchs/:id/sync-stock — recalcular stock del contenedor basado en productos individuales
-app.put('/api/matchs/:id/sync-stock', async (req, res) => {
-  const match = db.get('matchs').find({ id: req.params.id }).value();
-  if (!match) return res.status(404).json({ error: 'Match no encontrado' });
-  try {
+async function syncMatchStock(matchId) {
+  const match = db.get('matchs').find({ id: matchId }).value();
+  if (!match) { const e = new Error('Match no encontrado'); e.status = 404; throw e; }
+  {
     const [p1data, p2data] = await Promise.all([
       tnRequest('GET', `/products/${match.producto1.tn_product_id}?fields=id,variants`),
       tnRequest('GET', `/products/${match.producto2.tn_product_id}?fields=id,variants`)
@@ -1366,8 +1402,12 @@ app.put('/api/matchs/:id/sync-stock', async (req, res) => {
       await tnRequest('PUT', `/products/${match.tn_match_product_id}/variants/${vm.tn_variant_id}`, { stock: newStock });
       updated++;
     }
-    res.json({ ok: true, updated });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    return { ok: true, updated };
+  }
+}
+app.put('/api/matchs/:id/sync-stock', async (req, res) => {
+  try { res.json(await syncMatchStock(req.params.id)); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
 });
 
 // POST /api/admin/matchs/resync-all — re-sincronizar TODOS los matchs de una vez
@@ -1568,10 +1608,20 @@ app.get('/api/stats', (req, res) => {
 // Start
 // ════════════════════════════════════════════════════════════════════════════
 
-app.listen(PORT, () => {
-  console.log(`Stock Central v2 + Reservas en puerto ${PORT}`);
-  if (process.env.ACCESS_TOKEN && process.env.STORE_ID) {
-    db.set('config.access_token', process.env.ACCESS_TOKEN).set('config.store_id', process.env.STORE_ID).write();
-    console.log(`Credenciales cargadas: store ${process.env.STORE_ID}`);
-  }
-});
+function startBackgroundJobs() {
+  setInterval(() => releaseExpiredReservations().catch(e => console.error('[RESERVAS] Error:', e.message)), 60 * 1000);
+  setInterval(() => runReconcileCycle().catch(e => console.error('[RECONCILIAR] Error:', e.message)), 6 * 60 * 60 * 1000); // cada 6 horas
+}
+
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Stock Central v2 + Reservas en puerto ${PORT}`);
+    if (process.env.ACCESS_TOKEN && process.env.STORE_ID) {
+      db.set('config.access_token', process.env.ACCESS_TOKEN).set('config.store_id', process.env.STORE_ID).write();
+      console.log(`Credenciales cargadas: store ${process.env.STORE_ID}`);
+    }
+  });
+  startBackgroundJobs();
+}
+
+module.exports = { app, db, toNum, tnRequest, syncVariante, syncMatchStock, releaseExpiredReservations, runReconcileCycle, resyncAllMatchs, repairAllMatchVariants };
