@@ -58,8 +58,8 @@ app.use((req, res, next) => {
   const p = req.path.toLowerCase().replace(/\/+$/, '') || '/';
   if (!ADMIN_TOKEN || !(p === '/api' || p.startsWith('/api/')) || req.method === 'OPTIONS') return next();
   if (p === '/api/health') return next();
-  if (p === '/api/reserve' && req.method === 'POST') return next();
-  if (p.startsWith('/api/reserve/') && req.method === 'DELETE') return next();
+  if ((p === '/api/reserve' || p === '/api/reservations') && req.method === 'POST') return next();
+  if ((p.startsWith('/api/reserve/') || p.startsWith('/api/reservations/')) && req.method === 'DELETE') return next();
   const h = String(req.headers.authorization || '');
   const token = h.startsWith('Bearer ') ? h.slice(7) : String(req.query.token || '');
   if (token && safeEqual(token, ADMIN_TOKEN)) return next();
@@ -105,7 +105,7 @@ async function tnRequest(method, path, body = null) {
       });
     } catch (e) {
       clearTimeout(timer);
-      if (attempt < MAX_RETRIES) { await sleep(1000 * 2 ** attempt); continue; }
+      if (attempt < MAX_RETRIES && method !== 'POST') { await sleep(1000 * 2 ** attempt); continue; }
       throw new Error(e.name === 'AbortError' ? 'Tiendanube no respondió (timeout)' : `No se pudo conectar con Tiendanube: ${e.message}`);
     }
     clearTimeout(timer);
@@ -429,11 +429,11 @@ async function doSyncVariante({ productoId, varianteId, forceAll, force, progres
   for (const link of links) {
     const value = channelStock(allocation(productoId, varianteId), link.variant_id);
     let ok = true;
-    if (link.missing_in_tn && !forceAll) { notify({ current: ++current, total, label: link.label, ok: false }); continue; }
+    if (link.missing_in_tn && !forceAll && !force.has(String(link.variant_id))) { notify({ current: ++current, total, label: link.label, ok: false }); continue; }
     if (mustPush(link.variant_id, link.tn_stock, value, !!link.sync_error)) {
       try {
         await tnRequest('PUT', `/products/${link.product_id}/variants/${link.variant_id}`, { stock: value });
-        link.tn_stock = value; link.tn_synced_at = now(); delete link.sync_error;
+        link.tn_stock = value; link.tn_synced_at = now(); delete link.sync_error; delete link.missing_in_tn;
         updated++;
       } catch (e) {
         ok = false;
@@ -513,6 +513,7 @@ function orderAlreadyDiscounted(productoId, varianteId, order_id, tn_variant_id)
 }
 
 // ─── Reservas (holds) ────────────────────────────────────────────────────────
+const rejectForcedAt = new Map();
 const DUPLICATE_ADD_MS = 3000; // el storefront tiene varios hooks: el mismo "agregar" puede llegar repetido
 
 // Intenta reservar `qty` en cada lado (1 lado = producto normal, 2 = combo) para el canal dado.
@@ -530,7 +531,9 @@ function placeHolds(sessionId, sides, channel, meta = {}) {
     if (existing && existing.lastAddAt && now - existing.lastAddAt < DUPLICATE_ADD_MS && toNum(existing.lastAddQty) === side.qty) {
       return { ok: true, duplicate: true, ids: [existing.id] };
     }
-    if (alloc.free < side.qty) failing.push({ side, available: alloc.free });
+    const heldBySession = activeHolds(r => r.sessionId === sessionId && r.productoId === side.productoId && r.varianteId === side.varianteId)
+      .reduce((a, r) => a + toNum(r.qty), 0);
+    if (alloc.free < side.qty || heldBySession + side.qty > MAX_HELD_PER_SESSION) failing.push({ side, available: Math.min(alloc.free, Math.max(0, MAX_HELD_PER_SESSION - heldBySession)) });
     plan.push({ side, existing });
   }
 
@@ -547,8 +550,11 @@ function placeHolds(sessionId, sides, channel, meta = {}) {
         detail: `Alguien quiso agregar ${side.qty}${meta.label ? ` (${meta.label})` : ''} y quedaban ${available} libres. Tiendanube se corrigió para que no se pueda.`,
         productoId: side.productoId, varianteId: side.varianteId, variant_id: String(channel)
       });
-      // Si TN dejó agregarlo es porque tenía un número viejo: forzar el canal
-      syncVariante(side.productoId, side.varianteId, null, { force: [channel] }).catch(e => console.error('[RESERVAS] Sync error:', e.message));
+      // Si TN dejó agregarlo es porque tenía un número viejo: forzar el canal (como mucho 1 vez por minuto)
+      const fk = `${side.productoId}|${side.varianteId}|${channel}`;
+      const forceNow = !rejectForcedAt.has(fk) || Date.now() - rejectForcedAt.get(fk) > 60000;
+      if (forceNow) rejectForcedAt.set(fk, Date.now());
+      syncVariante(side.productoId, side.varianteId, null, forceNow ? { force: [channel] } : {}).catch(e => console.error('[RESERVAS] Sync error:', e.message));
     }
     return { ok: false, available: Math.min(...failing.map(f => f.available)) };
   }
@@ -805,11 +811,14 @@ async function reconcileProducts(onProgress) {
         delete link.missing_in_tn;
         chequeados++;
         const expected = channelStock(allocation(prod.id, variante.id), link.variant_id);
-        if (actual.stock === expected) { link.tn_stock = expected; continue; }
+        if (actual.stock === expected) { link.tn_stock = expected; delete link.sync_error; continue; }
         try {
           await tnRequest('PUT', `/products/${link.product_id}/variants/${link.variant_id}`, { stock: expected });
           link.tn_stock = expected; delete link.sync_error;
           corregidos++;
+          if (channelStock(allocation(prod.id, variante.id), link.variant_id) !== expected) {
+            syncVariante(prod.id, variante.id).catch(e => console.error('[RECONCILIAR] Sync:', e.message));
+          }
           console.log(`[RECONCILIAR] ${prod.nombre}/${variante.label} (${link.label}): TN ${actual.stock} → ${expected}`);
           addAlert({
             key: `discrepancy|${prod.id}|${variante.id}|${link.variant_id}`, type: 'discrepancy', severity: 'warning', reopen: true,
@@ -1218,8 +1227,24 @@ app.delete('/api/productos/:id/variantes/:varId/links/:variant_id', (req, res) =
 // Producto normal: retiene la unidad en el diseño elegido (los demás diseños que
 // comparten el stock bajan en TN). Combo: retiene en las dos variantes individuales.
 // Si no hay disponible → 409 y no se reserva nada.
+// Límite simple por IP: 40 pedidos por minuto por defecto (un cliente real hace muy pocos)
+const RESERVE_RATE_PER_MIN = Math.max(1, toNum(process.env.SC_RESERVE_RATE_PER_MIN) || 40);
+const reserveHits = new Map();
+function reserveRateLimited(ip) {
+  const now = Date.now();
+  const h = reserveHits.get(ip) || { n: 0, since: now };
+  if (now - h.since > 60000) { h.n = 0; h.since = now; }
+  h.n++;
+  reserveHits.set(ip, h);
+  if (reserveHits.size > 5000) for (const [k, v] of reserveHits) if (now - v.since > 60000) reserveHits.delete(k);
+  return h.n > RESERVE_RATE_PER_MIN;
+}
+const MAX_HELD_PER_SESSION = 10; // unidades por sesión y variante
+
 app.post('/api/reserve', (req, res) => {
   const { sessionId, variant_id } = req.body || {};
+  const ipKey = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || '?';
+  if (reserveRateLimited(ipKey)) return res.status(429).json({ error: 'Demasiados pedidos, probá en un minuto' });
   if (!sessionId || !variant_id) return res.status(400).json({ error: 'Faltan sessionId o variant_id' });
   const rawQty = req.body.qty === undefined || req.body.qty === null ? 1 : Number(req.body.qty);
   if (!Number.isInteger(rawQty) || rawQty < 1 || rawQty > 50) return res.status(400).json({ error: 'qty tiene que ser un entero entre 1 y 50' });
@@ -1277,6 +1302,18 @@ app.delete('/api/reserve/:sessionId', (req, res) => {
     h => `${holdLabel(h)}Sesión ${h.sessionId ? String(h.sessionId).slice(0, 8) : '?'} · Carrito vaciado`);
   if (released) console.log(`[RESERVAS] Liberadas ${released} reserva(s) de sesión ${sessionId}`);
   res.json({ ok: true, released });
+});
+
+// Alias para versiones viejas del script del storefront (/api/reservations con variantId / ?sku=)
+app.post('/api/reservations', (req, res, next) => {
+  if (req.body && req.body.variant_id === undefined) req.body.variant_id = req.body.variantId;
+  req.url = '/api/reserve';
+  app.handle(req, res, next);
+});
+app.delete('/api/reservations/:sessionId', (req, res, next) => {
+  const v = req.query.variant_id || req.query.sku;
+  req.url = `/api/reserve/${encodeURIComponent(req.params.sessionId)}${v ? `?variant_id=${encodeURIComponent(v)}` : ''}`;
+  app.handle(req, res, next);
 });
 
 // ════════════════════════════════════════════════════════════════════════════

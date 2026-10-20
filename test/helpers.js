@@ -170,6 +170,7 @@ async function startServer(world = {}) {
   process.env.DB_PATH = dbPath;
   process.env.TN_API_BASE = tn.url;
   process.env.TN_THROTTLE = 'off';
+  process.env.SC_RESERVE_RATE_PER_MIN = '100000'; // todos los tests reservan desde 127.0.0.1
   delete process.env.ADMIN_TOKEN;
   delete process.env.ACCESS_TOKEN;
   delete process.env.STORE_ID;
